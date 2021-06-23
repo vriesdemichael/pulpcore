@@ -1,4 +1,7 @@
 import asyncio
+import os
+import shlex
+import subprocess
 from collections import defaultdict
 from gettext import gettext as _
 import logging
@@ -350,3 +353,41 @@ class RemoteArtifactSaver(Stage):
         )
         ra.validate_checksums()
         return ra
+
+
+class ArtifactScanner(Stage):
+    """
+    Takes in units of DeclarativeContent
+    Outputs units which did not contain viruses.
+
+    """
+    def __init__(self):
+        super().__init__()
+        security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
+        if not security_scan_shell:
+            raise ValueError()
+        self.av_call = shlex.split(security_scan_shell)
+
+    async def run(self):
+
+        async for d_content in self.items():
+
+            virus_found = False
+            for d_artifact in d_content.d_artifacts:
+
+                scan_cmd = [*self.av_call, d_artifact.artifact.file.name]
+
+                log.info("Scanning %s with %s", d_content, scan_cmd)
+                status_code = subprocess.call(scan_cmd)
+                if status_code != 0:
+                    log.info("Found virus in artifact of %s", d_content)
+
+                    # infected_artifact: Artifact = d_artifact.artifact
+                    # d_content.content.delete()  # TODO is this actually needed?
+                    # infected_artifact.delete()  # TODO Is this actually needed? Its not saved yet
+                    virus_found = True
+                    break
+                    # TODO prevent from being downloaded after the first time
+
+            if not virus_found:
+                await self.put(d_content)

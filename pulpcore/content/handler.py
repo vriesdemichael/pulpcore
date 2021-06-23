@@ -2,6 +2,8 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
+import subprocess
 from gettext import gettext as _
 
 from aiohttp.client_exceptions import ClientResponseError
@@ -9,6 +11,9 @@ from aiohttp.web import FileResponse, StreamResponse, HTTPOk
 from aiohttp.web_exceptions import HTTPForbidden, HTTPFound, HTTPNotFound
 
 import django
+
+from pulpcore.download import BaseDownloader, DownloadResult
+from pulpcore.exceptions.http import VirusFoundError
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pulpcore.app.settings")
 django.setup()
@@ -321,6 +326,41 @@ class Handler:
         else:
             raise PathNotResolved(path)
 
+    async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):  # TODO better self documenting name
+        security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
+        av_enabled = security_scan_shell != ""
+
+        if av_enabled:
+            if not ca.artifact:
+                log.info("Artifact not yet available for %s, downloading", ca)
+                for remote_artifact in ca.remoteartifact_set.all():
+                    remote: Remote = remote_artifact.remote.cast()
+                    downloader: BaseDownloader = remote.get_downloader(remote_artifact)
+                    download_result: DownloadResult = await downloader.run()
+
+                    log.info("Downloaded")
+
+                    if remote.policy != Remote.STREAMED:
+                        self._save_artifact(download_result, remote_artifact)
+
+            scan_cmd = shlex.split(security_scan_shell)
+            file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
+            scan_cmd.append(file_location)
+            log.info(f"Scanning artifact of %s with %s", ca, scan_cmd)
+
+            status_code = subprocess.call(scan_cmd)
+            if status_code != 0:
+                log.info("Found virus in %s", str(ca))
+                raise VirusFoundError()
+
+            # Artifact available and scanned, serve to client
+            return self._serve_content_artifact(ca, headers)
+        else:
+            if ca.artifact:
+                return self._serve_content_artifact(ca, headers)
+            else:
+                return await self._stream_content_artifact(request, StreamResponse(headers=headers), ca)
+
     async def _match_and_stream(self, path, request):
         """
         Match the path and stream results either from the filesystem or by downloading new data.
@@ -390,12 +430,7 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                if ca.artifact:
-                    return self._serve_content_artifact(ca, headers)
-                else:
-                    return await self._stream_content_artifact(
-                        request, StreamResponse(headers=headers), ca
-                    )
+                await self._determine_serve_or_scan(ca, request, headers)
 
             # pass-through
             if publication.pass_through:
@@ -412,12 +447,7 @@ class Handler:
                 except ObjectDoesNotExist:
                     pass
                 else:
-                    if ca.artifact:
-                        return self._serve_content_artifact(ca, headers)
-                    else:
-                        return await self._stream_content_artifact(
-                            request, StreamResponse(headers=headers), ca
-                        )
+                    await self._determine_serve_or_scan(ca, request, headers)
 
         repo_version = getattr(distro, "repository_version", None)
         repository = getattr(distro, "repository", None)
@@ -453,17 +483,12 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                if ca.artifact:
-                    return self._serve_content_artifact(ca, headers)
-                else:
-                    return await self._stream_content_artifact(
-                        request, StreamResponse(headers=headers), ca
-                    )
+                await self._determine_serve_or_scan(ca, request, headers)
 
         if distro.remote:
             remote = distro.remote.cast()
+            url = remote.get_remote_artifact_url(rel_path)
             try:
-                url = remote.get_remote_artifact_url(rel_path)
                 ra = RemoteArtifact.objects.select_related(
                     "content_artifact",
                     "content_artifact__artifact",
@@ -629,7 +654,7 @@ class Handler:
         Args:
             request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
             response (:class:`~aiohttp.web.StreamResponse`): The response to stream data to.
-            content_artifact (:class:`~pulpcore.plugin.models.ContentArtifact`): The ContentArtifact
+            remote_artifact (:class:`~pulpcore.plugin.models.RemoteArtifact`): The RemoteArtifact
                 to fetch and then stream back to the client
 
         Raises:

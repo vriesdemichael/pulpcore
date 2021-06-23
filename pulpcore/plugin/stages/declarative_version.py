@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 
 from .api import create_pipeline, EndStage
@@ -7,6 +8,7 @@ from .artifact_stages import (
     ArtifactSaver,
     QueryExistingArtifacts,
     RemoteArtifactSaver,
+    ArtifactScanner,
 )
 from .association_stages import ContentAssociation, ContentUnassociation
 from .content_stages import ContentSaver, QueryExistingContents, ResolveContentFutures
@@ -123,6 +125,7 @@ class DeclarativeVersion:
             self.first_stage,
             QueryExistingArtifacts(),
             ArtifactDownloader(),
+            ArtifactScanner(),  # TODO make conditional
             ArtifactSaver(),
             QueryExistingContents(),
             ContentSaver(),
