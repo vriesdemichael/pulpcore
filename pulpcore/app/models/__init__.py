@@ -17,6 +17,7 @@ from .content import (  # noqa
     RemoteArtifact,
     SigningService,
     UnsupportedDigestValidationError,
+    ScanResult,
 )
 from .generic import GenericRelationModel  # noqa
 from .exporter import (  # noqa

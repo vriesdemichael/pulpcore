@@ -9,6 +9,7 @@ from .artifact_stages import (
     QueryExistingArtifacts,
     RemoteArtifactSaver,
     ArtifactScanner,
+    ScanResultEjection,
 )
 from .association_stages import ContentAssociation, ContentUnassociation
 from .content_stages import ContentSaver, QueryExistingContents, ResolveContentFutures
@@ -125,13 +126,18 @@ class DeclarativeVersion:
             self.first_stage,
             QueryExistingArtifacts(),
             ArtifactDownloader(),
-            ArtifactScanner(),  # TODO make conditional
             ArtifactSaver(),
             QueryExistingContents(),
             ContentSaver(),
             RemoteArtifactSaver(),
             ResolveContentFutures(),
         ]
+
+        scanner_command = os.environ.get("SECURITY_SCAN_SHELL", "")
+        if scanner_command:
+            pipeline.insert(2, ScanResultEjection(scanner_command))  # after QueryExistingArtifacts
+            pipeline.append(ArtifactScanner(scanner_command))
+
         return pipeline
 
     def create(self):

@@ -1,17 +1,22 @@
+import asyncio
 import logging
 import mimetypes
 import os
 import re
 import shlex
 import subprocess
+from datetime import timedelta
 from gettext import gettext as _
+from typing import Optional
 
 from aiohttp.client_exceptions import ClientResponseError
 from aiohttp.web import FileResponse, StreamResponse, HTTPOk
 from aiohttp.web_exceptions import HTTPForbidden, HTTPFound, HTTPNotFound
 
 import django
+from django.utils import timezone
 
+from pulpcore.app.models.content import ScanResult, Content
 from pulpcore.download import BaseDownloader, DownloadResult
 from pulpcore.exceptions.http import VirusFoundError
 
@@ -326,32 +331,64 @@ class Handler:
         else:
             raise PathNotResolved(path)
 
+    @staticmethod
+    def get_scan_result_for(content: Content, scan_command: str) -> Optional[ScanResult]:
+        try:
+            return ScanResult.objects.get(
+                content=content,
+                scan_command=scan_command
+            )
+        except ScanResult.DoesNotExist:
+            return None
+
     async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):  # TODO better self documenting name
         security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
-        av_enabled = security_scan_shell != ""
+        av_enabled = security_scan_shell != ""  # TODO make configurable
 
         if av_enabled:
+            needs_av_scan = True
+            # Determine if a scan is needed
+            sr: Optional[ScanResult] = self.get_scan_result_for(ca.content, security_scan_shell)
+            if sr and sr.contains_virus:
+                # Skip download
+                raise VirusFoundError()  # TODO I think this will never occur, but can I be sure?
+            elif sr and ca.artifact:
+                if timezone.now() - sr.pulp_last_updated < timedelta(days=1):
+                    needs_av_scan = False
+
+            # Download if needed
             if not ca.artifact:
                 log.info("Artifact not yet available for %s, downloading", ca)
-                for remote_artifact in ca.remoteartifact_set.all():
-                    remote: Remote = remote_artifact.remote.cast()
-                    downloader: BaseDownloader = remote.get_downloader(remote_artifact)
+
+                async def synchronous_download(ra: RemoteArtifact):
+                    remote: Remote = ra.remote.cast()
+                    downloader: BaseDownloader = remote.get_downloader(ra)
                     download_result: DownloadResult = await downloader.run()
-
-                    log.info("Downloaded")
-
                     if remote.policy != Remote.STREAMED:
-                        self._save_artifact(download_result, remote_artifact)
+                        self._save_artifact(download_result, ra)
 
-            scan_cmd = shlex.split(security_scan_shell)
-            file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
-            scan_cmd.append(file_location)
-            log.info(f"Scanning artifact of %s with %s", ca, scan_cmd)
+                await asyncio.gather(synchronous_download(ra) for ra in ca.remoteartifact_set.all())
 
-            status_code = subprocess.call(scan_cmd)
-            if status_code != 0:
-                log.info("Found virus in %s", str(ca))
-                raise VirusFoundError()
+            if needs_av_scan:
+                scan_command = shlex.split(security_scan_shell)
+                file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
+                scan_command.append(file_location)
+
+                status_code = subprocess.call(scan_command)
+
+                if sr:
+                    sr.contains_virus = bool(status_code)
+                else:
+                    sr = ScanResult(contains_virus=bool(status_code), content=ca.content, scan_command=security_scan_shell)
+                sr.save()
+
+                if sr.contains_virus:
+                    log.info("Found virus in %s, removing artifact", ca.artifact)
+                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))  # delete file
+                    ca.delete()  # Should cascade into artifact as well
+                    raise VirusFoundError
+            else:
+                log.info("Scan not needed for %s due to previous scan result", ca)
 
             # Artifact available and scanned, serve to client
             return self._serve_content_artifact(ca, headers)
@@ -430,7 +467,7 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                await self._determine_serve_or_scan(ca, request, headers)
+                return await self._determine_serve_or_scan(ca, request, headers)
 
             # pass-through
             if publication.pass_through:
@@ -447,7 +484,7 @@ class Handler:
                 except ObjectDoesNotExist:
                     pass
                 else:
-                    await self._determine_serve_or_scan(ca, request, headers)
+                    return await self._determine_serve_or_scan(ca, request, headers)
 
         repo_version = getattr(distro, "repository_version", None)
         repository = getattr(distro, "repository", None)
@@ -483,7 +520,7 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                await self._determine_serve_or_scan(ca, request, headers)
+                return await self._determine_serve_or_scan(ca, request, headers)
 
         if distro.remote:
             remote = distro.remote.cast()

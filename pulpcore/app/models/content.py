@@ -719,3 +719,41 @@ class AsciiArmoredDetachedSigningService(SigningService):
                                 "key are not equal. The signing script is probably not valid."
                             )
                         )
+
+
+class ScanResult(BaseModel, QueryMixin):
+    """
+    The scan result belonging to a content artifact with a specific scan command.
+
+
+    Fields:
+        contains_virus (models.NullBooleanField): The expected size of the file in bytes.
+        scan_command (models.TextField): The expected MD5 checksum of the file.
+
+    Relations:
+        content (:class:`pulpcore.app.models.ForeignKey`):
+            Content associated with this ScanResult.
+
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    contains_virus = models.NullBooleanField()
+    scan_command = models.TextField()
+
+    content = models.ForeignKey(Content, on_delete=models.CASCADE)
+
+    objects = BulkCreateManager()
+
+    class Meta:
+        unique_together = ("content", "scan_command")
+
+    def __str__(self):
+        return "<{} scan_command=\"{}\", contains_virus={} last_updated={} content={} pk={}>".format(
+            self._meta.object_name,
+            self.scan_command,
+            self.contains_virus,
+            self.pulp_last_updated,
+            self.content,
+            self.pk
+        )
