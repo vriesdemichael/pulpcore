@@ -405,7 +405,9 @@ class ArtifactScanner(Stage):
     @staticmethod
     def cleanup_infected_content(d_content):
         for d_artifact in d_content.d_artifacts:
-            os.unlink(os.path.join(settings.MEDIA_ROOT, d_artifact.file.name))  # delete file
+            os.unlink(os.path.join(settings.MEDIA_ROOT, d_artifact.artifact.file.name))  # delete file
+            ca: ContentArtifact = ContentArtifact.objects.get(content=d_content, artifact=d_artifact)
+            ca.delete()  # TODO double check file deletion
             d_artifact.artifact.delete()
 
 
@@ -428,6 +430,7 @@ class ScanResultEjection(Stage):
                 content=d_content.content,
                 scan_command=self.scan_command
             )
+
         except ScanResult.DoesNotExist:
             return None
 
@@ -435,7 +438,7 @@ class ScanResultEjection(Stage):
         from pulpcore.plugin.stages import DeclarativeContent
         d_content: DeclarativeContent
         async for d_content in self.items():
-            sr: Optional[ScanResult] = self.get_scan_result_for(d_content.content)
+            sr: Optional[ScanResult] = self.get_scan_result_for(d_content)
             if sr and sr.contains_virus:
                 log.info("Will not process %s because of an earlier found virus", d_content)
                 continue  # do not pass to next stage

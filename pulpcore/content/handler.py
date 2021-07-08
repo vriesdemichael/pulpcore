@@ -341,39 +341,43 @@ class Handler:
         except ScanResult.DoesNotExist:
             return None
 
-    async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):  # TODO better self documenting name
+    async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):
         security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
-        av_enabled = security_scan_shell != ""  # TODO make configurable
+        av_enabled = security_scan_shell != ""  # TODO make configurable using django.settings
 
         if av_enabled:
             needs_av_scan = True
+
+            ra: RemoteArtifact = RemoteArtifact.objects.get(content_artifact=ca)
+            remote: Remote = ra.remote.cast()
+            policy = remote.cast().policy
+
             # Determine if a scan is needed
             sr: Optional[ScanResult] = self.get_scan_result_for(ca.content, security_scan_shell)
-            if sr and sr.contains_virus:
-                # Skip download
-                raise VirusFoundError()  # TODO I think this will never occur, but can I be sure?
-            elif sr and ca.artifact:
-                if timezone.now() - sr.pulp_last_updated < timedelta(days=1):
+            if sr and ca.artifact and policy != Remote.STREAMED:
+                last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO configurable update time
+                if last_midnight < sr.pulp_last_updated:
                     needs_av_scan = False
 
             # Download if needed
-            if not ca.artifact:
+            if not ca.artifact or policy == Remote.STREAMED:
                 log.info("Artifact not yet available for %s, downloading", ca)
 
                 async def synchronous_download(ra: RemoteArtifact):
                     remote: Remote = ra.remote.cast()
                     downloader: BaseDownloader = remote.get_downloader(ra)
                     download_result: DownloadResult = await downloader.run()
-                    if remote.policy != Remote.STREAMED:
-                        self._save_artifact(download_result, ra)
+                    log.info("Downloaded %s", ra)
+                    self._save_artifact(download_result, ra)
+                    log.info("Stored %s", ra)
 
-                await asyncio.gather(synchronous_download(ra) for ra in ca.remoteartifact_set.all())
+                await asyncio.gather(*[synchronous_download(ra) for ra in ca.remoteartifact_set.all()])
 
             if needs_av_scan:
                 scan_command = shlex.split(security_scan_shell)
                 file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
-                scan_command.append(file_location)
 
+                scan_command.append(file_location)
                 status_code = subprocess.call(scan_command)
 
                 if sr:
@@ -382,16 +386,37 @@ class Handler:
                     sr = ScanResult(contains_virus=bool(status_code), content=ca.content, scan_command=security_scan_shell)
                 sr.save()
 
+                log.info("Scanned %s (%s) with %s: contains_virus = %s", ca, ca.content, security_scan_shell, sr.contains_virus)
+
                 if sr.contains_virus:
                     log.info("Found virus in %s, removing artifact", ca.artifact)
-                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))  # delete file
-                    ca.delete()  # Should cascade into artifact as well
+                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))
+                    if policy != Remote.STREAMED:
+                        ca.delete()  # Should cascade into artifact as well
+                    else:
+                        artifact = ca.artifact
+                        ca.artifact = None
+                        ca.save()
+                        artifact.delete()
                     raise VirusFoundError
+
             else:
                 log.info("Scan not needed for %s due to previous scan result", ca)
 
             # Artifact available and scanned, serve to client
-            return self._serve_content_artifact(ca, headers)
+            try:
+                return await self._stream_remote_artifact(request, StreamResponse(headers=headers), ra)
+                # return self._serve_content_artifact(ca, headers)
+            finally:
+
+                if policy == Remote.STREAMED:
+                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))
+                    artifact = ca.artifact
+                    ca.artifact = None
+                    ca.save()
+                    artifact.delete()
+                    log.info("Artifact is deleted")
+
         else:
             if ca.artifact:
                 return self._serve_content_artifact(ca, headers)
