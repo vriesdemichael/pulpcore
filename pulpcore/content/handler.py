@@ -5,7 +5,7 @@ import os
 import re
 import shlex
 import subprocess
-from datetime import timedelta
+import tempfile
 from gettext import gettext as _
 from typing import Optional
 
@@ -341,16 +341,41 @@ class Handler:
         except ScanResult.DoesNotExist:
             return None
 
+    async def _serve_from_readable(self, request, readable, headers):
+        """
+        Serve an artifact directly from a readable (such as from the django-storage backends)
+        args:
+            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            readable: A readable source (must implement the open and read functions)
+            headers (dict): A dictionary of response headers.
+
+        Returns:
+            The :class:`aiohttp.web.StreamResponse` for the file.
+
+        """
+        
+        response = StreamResponse(headers=headers)
+        await response.prepare(request)
+
+        chunk_size = 256 * 1024
+        chunk = readable.read(chunk_size)
+        while chunk:
+            chunk = readable.read(chunk_size)
+            await response.write(chunk)
+        await response.write_eof()
+
+        return response
+
     async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):
+        """
+        TODO write documentation :)
+        """
         security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
         av_enabled = security_scan_shell != ""  # TODO make configurable using django.settings
 
         if av_enabled:
             needs_av_scan = True
-
-            ra: RemoteArtifact = RemoteArtifact.objects.get(content_artifact=ca)
-            remote: Remote = ra.remote.cast()
-            policy = remote.cast().policy
+            policy = RemoteArtifact.objects.get(content_artifact=ca).remote.cast().policy
 
             # Determine if a scan is needed
             sr: Optional[ScanResult] = self.get_scan_result_for(ca.content, security_scan_shell)
@@ -364,8 +389,7 @@ class Handler:
                 log.info("Artifact not yet available for %s, downloading", ca)
 
                 async def synchronous_download(ra: RemoteArtifact):
-                    remote: Remote = ra.remote.cast()
-                    downloader: BaseDownloader = remote.get_downloader(ra)
+                    downloader: BaseDownloader = ra.remote.cast().get_downloader(ra)
                     download_result: DownloadResult = await downloader.run()
                     log.info("Downloaded %s", ra)
                     self._save_artifact(download_result, ra)
@@ -375,10 +399,12 @@ class Handler:
 
             if needs_av_scan:
                 scan_command = shlex.split(security_scan_shell)
-                file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
 
-                scan_command.append(file_location)
-                status_code = subprocess.call(scan_command)
+                with tempfile.NamedTemporaryFile(dir=settings.WORKING_DIRECTORY, mode="wb") as tmp_scan_file:
+                    with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
+                        tmp_scan_file.write(stored_file.read())
+                        scan_command.append(os.path.abspath(tmp_scan_file.name))
+                        status_code = subprocess.call(scan_command)
 
                 if sr:
                     sr.contains_virus = bool(status_code)
@@ -399,23 +425,24 @@ class Handler:
                         ca.save()
                         artifact.delete()
                     raise VirusFoundError
-
             else:
                 log.info("Scan not needed for %s due to previous scan result", ca)
 
-            # Artifact available and scanned, serve to client
             try:
-                return await self._stream_remote_artifact(request, StreamResponse(headers=headers), ra)
-                # return self._serve_content_artifact(ca, headers)
+                # TODO dont store STREAMED on backend
+                # TODO serve downloaded files from temp scan file instead of backend
+                with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
+                    # Read the file from the backed to serve to the client
+                    # TODO redirect to backend instead like in the serve function (s3/azure)
+                    return await self._serve_from_readable(request, stored_file, headers)
             finally:
-
                 if policy == Remote.STREAMED:
-                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))
+                    # Unlink the downloaded (and stored) artifact from the content artifact to preserve the ca
                     artifact = ca.artifact
                     ca.artifact = None
                     ca.save()
                     artifact.delete()
-                    log.info("Artifact is deleted")
+                    log.info("Artifact is deleted due to streamed policy")
 
         else:
             if ca.artifact:
