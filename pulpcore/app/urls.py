@@ -16,6 +16,7 @@ from rest_framework_nested import routers
 
 from pulpcore.app.apps import pulp_plugin_configs
 from pulpcore.app.views import OrphansView, PulpImporterImportCheckView, RepairView, StatusView
+from pulpcore.app.views.scan import ScanView
 from pulpcore.app.viewsets import ListRepositoryVersionViewSet
 from pulpcore.constants import API_ROOT
 from pulpcore.openapi import PulpSchemaGenerator
@@ -122,6 +123,7 @@ root_router = routers.DefaultRouter()
 
 urlpatterns = [
     url(r"^{api_root}repair/".format(api_root=API_ROOT), RepairView.as_view()),
+    url(r"^{api_root}scan/".format(api_root=API_ROOT), ScanView.as_view()),
     url(r"^{api_root}status/".format(api_root=API_ROOT), StatusView.as_view()),
     url(r"^{api_root}orphans/".format(api_root=API_ROOT), OrphansView.as_view()),
     url(
