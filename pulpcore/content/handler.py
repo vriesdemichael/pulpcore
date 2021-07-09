@@ -399,7 +399,7 @@ class Handler:
 
             if needs_av_scan:
                 scan_command = shlex.split(security_scan_shell)
-
+                # TODO dont create copy when file is in local storage
                 with tempfile.NamedTemporaryFile(dir=settings.WORKING_DIRECTORY, mode="wb") as tmp_scan_file:
                     with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
                         chunk_size = 256 * 1024

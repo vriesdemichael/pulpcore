@@ -381,6 +381,7 @@ class ArtifactScanner(Stage):
         async for d_content in self.items():
             contains_virus = False
             for d_artifact in d_content.d_artifacts:
+                # TODO implement other storage backends (now incorrectly assumes FileStorage)
                 if d_artifact.deferred_download:
                     contains_virus = None  # indicates not scanned yet
                     break  # expect all downloads to be deferred
