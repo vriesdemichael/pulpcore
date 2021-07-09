@@ -402,7 +402,12 @@ class Handler:
 
                 with tempfile.NamedTemporaryFile(dir=settings.WORKING_DIRECTORY, mode="wb") as tmp_scan_file:
                     with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
-                        tmp_scan_file.write(stored_file.read())
+                        chunk_size = 256 * 1024
+                        chunk = stored_file.read(chunk_size)
+                        while chunk:
+                            tmp_scan_file.write(chunk)
+                            chunk = stored_file.read(chunk_size)
+
                         scan_command.append(os.path.abspath(tmp_scan_file.name))
                         status_code = subprocess.call(scan_command)
 
@@ -429,15 +434,15 @@ class Handler:
                 log.info("Scan not needed for %s due to previous scan result", ca)
 
             try:
-                # TODO dont store STREAMED on backend
+                # TODO dont store STREAMED on backend (although it might be good to do so anyway, to prevent memory overloads
                 # TODO serve downloaded files from temp scan file instead of backend
                 with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
                     # Read the file from the backed to serve to the client
-                    # TODO redirect to backend instead like in the serve function (s3/azure)
+                    # TODO redirect to backend instead like in the serve function (s3/azure) (does this work for streamed?)
                     return await self._serve_from_readable(request, stored_file, headers)
             finally:
                 if policy == Remote.STREAMED:
-                    # Unlink the downloaded (and stored) artifact from the content artifact to preserve the ca
+                    # When streamed mode is enabled, remove the artifact part of the content artifact so it will download again.
                     artifact = ca.artifact
                     ca.artifact = None
                     ca.save()
