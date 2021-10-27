@@ -408,7 +408,7 @@ class ArtifactScanner(Stage):
         for d_artifact in d_content.d_artifacts:
             os.unlink(os.path.join(settings.MEDIA_ROOT, d_artifact.artifact.file.name))  # delete file
             ca: ContentArtifact = ContentArtifact.objects.get(content=d_content, artifact=d_artifact)
-            ca.delete()  # TODO double check file deletion
+            ca.delete()
             d_artifact.artifact.delete()
 
 

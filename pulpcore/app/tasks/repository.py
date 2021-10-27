@@ -212,10 +212,7 @@ def scan_all_artifacts(scan_command):
 
         if sr.contains_virus:
             log.info("Found virus in %s, removing artifact", ca.artifact)
-            # log.info("File info before %s ", os.stat(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)))
-            ca.delete()  # TODO check if this also deleted the file from disk
-            # log.info("File info after %s ", os.stat(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)))
-            # os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))
+            ca.delete()
 
 
 def add_and_remove(repository_pk, add_content_units, remove_content_units, base_version_pk=None):

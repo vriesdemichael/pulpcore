@@ -368,10 +368,34 @@ class Handler:
 
     async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):
         """
-        TODO write documentation :)
+        This function will either:
+        1. Serve the artifact contained in the content artifact as usual.
+        2. a) Retrieve the targeted artifact
+           b) store it in the storage backend
+           c) scan it and store the scan result
+           d) serve it from the storage backend
+
+        A scan will be required if
+        1. Virus scanning is set up and
+        2. There was no previous scan result using the same configured scan command or
+        3. The stored scan result is no longer valid (from before the previous midnight)
+
+
+         Args:
+            ca (:class:`~pulpcore.plugin.models.ContentArtifact`): The ContentArtifact
+                to fetch and then stream back to the client
+            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            headers (dict): A dictionary of response headers.
+
+        Raises:
+            VirusFoundError: When the requested ca contains a virus.
+
+        Returns:
+            :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
+                streamed back to the client.
         """
         security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
-        av_enabled = security_scan_shell != ""  # TODO make configurable using django.settings
+        av_enabled = security_scan_shell != ""
 
         if av_enabled:
             needs_av_scan = True
@@ -380,7 +404,7 @@ class Handler:
             # Determine if a scan is needed
             sr: Optional[ScanResult] = self.get_scan_result_for(ca.content, security_scan_shell)
             if sr and ca.artifact and policy != Remote.STREAMED:
-                last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO configurable update time
+                last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO make configurable
                 if last_midnight < sr.pulp_last_updated:
                     needs_av_scan = False
 
@@ -435,14 +459,15 @@ class Handler:
 
             try:
                 # TODO dont store STREAMED on backend (although it might be good to do so anyway, to prevent memory overloads
-                # TODO serve downloaded files from temp scan file instead of backend
+                # TODO or implement a chunked upload from the filesystem, that just requires creating a hook that deletes the file afterwards, complicated stuff.
+                # TODO serve downloaded files from temp scan file instead of backend when it is not in the backend yet.
                 with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
                     # Read the file from the backed to serve to the client
                     # TODO redirect to backend instead like in the serve function (s3/azure) (does this work for streamed?)
                     return await self._serve_from_readable(request, stored_file, headers)
             finally:
                 if policy == Remote.STREAMED:
-                    # When streamed mode is enabled, remove the artifact part of the content artifact so it will download again.
+                    # When streamed mode is enabled, remove the artifact part of the content artifact so it will download again with the next request (this is sketchy)
                     artifact = ca.artifact
                     ca.artifact = None
                     ca.save()

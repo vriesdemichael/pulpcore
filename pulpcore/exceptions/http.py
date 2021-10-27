@@ -31,7 +31,6 @@ class MissingResource(PulpException):
 
 
 class VirusFoundError(HTTPClientError):
-    # TODO might be better to use PulpException as a base, not sure how to manage the status code properly with it
     status_code = 409
 
     def __init__(self, **kwargs) -> None:
