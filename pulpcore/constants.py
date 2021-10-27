@@ -8,6 +8,7 @@ TASK_STATES = SimpleNamespace(
     COMPLETED="completed",
     FAILED="failed",
     CANCELED="canceled",
+    CANCELING="canceling",
 )
 
 # The same as above, but in a format that choice fields can use
@@ -18,6 +19,7 @@ TASK_CHOICES = (
     (TASK_STATES.COMPLETED, "Completed"),
     (TASK_STATES.FAILED, "Failed"),
     (TASK_STATES.CANCELED, "Canceled"),
+    (TASK_STATES.CANCELING, "Canceling"),
 )
 
 #: Tasks in a final state have finished their work.
@@ -29,7 +31,7 @@ TASK_FINAL_STATES = (
 )
 
 #: Tasks in an incomplete state have not finished their work yet.
-TASK_INCOMPLETE_STATES = (TASK_STATES.WAITING, TASK_STATES.RUNNING)
+TASK_INCOMPLETE_STATES = (TASK_STATES.WAITING, TASK_STATES.RUNNING, TASK_STATES.CANCELING)
 
 
 SYNC_MODES = SimpleNamespace(ADDITIVE="additive", MIRROR="mirror")
@@ -49,3 +51,15 @@ API_ROOT = "pulp/api/v3/"
 # adding here won't make a new type-of checksum available. sha256 MUST be here,
 # as Pulp relies on it to identify entities.
 ALL_KNOWN_CONTENT_CHECKSUMS = {"md5", "sha1", "sha224", "sha256", "sha384", "sha512"}
+
+
+FS_EXPORT_METHODS = SimpleNamespace(
+    WRITE="write",
+    HARDLINK="hardlink",
+    SYMLINK="symlink",
+)
+FS_EXPORT_CHOICES = (
+    (FS_EXPORT_METHODS.WRITE, "Export by writing"),
+    (FS_EXPORT_METHODS.HARDLINK, "Export by hardlinking"),
+    (FS_EXPORT_METHODS.SYMLINK, "Export by symlinking"),
+)

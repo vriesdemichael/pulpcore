@@ -1,7 +1,6 @@
-from collections import namedtuple
-
 from drf_spectacular.utils import extend_schema
 
+from django.db import DatabaseError
 from django.db.utils import IntegrityError
 
 from pulpcore.app import tasks
@@ -15,8 +14,6 @@ from pulpcore.plugin.viewsets import (
     ContentViewSet,
     OperationPostponedResponse,
 )
-
-ContentUploadData = namedtuple("ContentUploadData", ["shared_resources", "task_payload"])
 
 
 class DefaultDeferredContextMixin:
@@ -51,15 +48,15 @@ class NoArtifactContentUploadViewSet(DefaultDeferredContextMixin, ContentViewSet
         temp_file = PulpTemporaryFile.init_and_validate(file_content)
         temp_file.save()
 
-        shared_resources = []
+        resources = []
         repository = serializer.validated_data.get("repository")
         if repository:
-            shared_resources.append(repository)
+            resources.append(repository)
 
         app_label = self.queryset.model._meta.app_label
         task = dispatch(
             tasks.base.general_create_from_temp_file,
-            shared_resources,
+            exclusive_resources=resources,
             args=(app_label, serializer.__class__.__name__, str(temp_file.pk)),
             kwargs={"data": task_payload, "context": self.get_deferred_context(request)},
         )
@@ -79,19 +76,20 @@ class SingleArtifactContentUploadViewSet(DefaultDeferredContextMixin, ContentVie
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        content_data = self.init_content_data(serializer, request)
+        task_payload = self.init_content_data(serializer, request)
 
+        resources = []
         repository = serializer.validated_data.get("repository")
         if repository:
-            content_data.shared_resources.append(repository)
+            resources.append(repository)
 
         app_label = self.queryset.model._meta.app_label
         task = dispatch(
             tasks.base.general_create,
-            content_data.shared_resources,
             args=(app_label, serializer.__class__.__name__),
+            exclusive_resources=resources,
             kwargs={
-                "data": content_data.task_payload,
+                "data": task_payload,
                 "context": self.get_deferred_context(request),
             },
         )
@@ -109,10 +107,15 @@ class SingleArtifactContentUploadViewSet(DefaultDeferredContextMixin, ContentVie
                 artifact.save()
             except IntegrityError:
                 # if artifact already exists, let's use it
-                artifact = Artifact.objects.get(sha256=artifact.sha256)
+                try:
+                    artifact = Artifact.objects.get(sha256=artifact.sha256)
+                    artifact.touch()
+                except (Artifact.DoesNotExist, DatabaseError):
+                    # the artifact has since been removed from when we first attempted to save it
+                    artifact.save()
 
             task_payload["artifact"] = ArtifactSerializer(
                 artifact, context={"request": request}
             ).data["pulp_href"]
 
-        return ContentUploadData([artifact], task_payload)
+        return task_payload

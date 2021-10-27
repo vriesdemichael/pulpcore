@@ -1,8 +1,10 @@
 # This config represents the latest values used when running the plugin-template. Any settings that
 # were not present before running plugin-template have been added with their default values.
 
+# generated with plugin_template@2021.04.08-98-gd000611
+
 additional_repos:
-- branch: master
+- branch: main
   name: pulp_file
 - branch: master
   name: pulp-certguard
@@ -13,6 +15,9 @@ check_manifest: true
 check_openapi_schema: true
 check_stray_pulpcore_imports: false
 cherry_pick_automation: false
+ci_env: {}
+ci_trigger: '{pull_request: {branches: [''*'']}}'
+core_import_allowed: []
 coverage: true
 deploy_client_to_pypi: true
 deploy_client_to_rubygems: true
@@ -21,7 +26,9 @@ deploy_daily_client_to_rubygems: true
 deploy_to_pypi: true
 docker_fixtures: true
 docs_test: true
+flake8: true
 issue_tracker: redmine
+noissue_marker: '[noissue]'
 plugin_app_label: core
 plugin_camel: Pulpcore
 plugin_camel_short: Pulpcore
@@ -32,36 +39,37 @@ plugin_dash_short: pulpcore
 plugin_default_branch: master
 plugin_name: pulpcore
 plugin_snake: pulpcore
+post_job_template: null
+pre_job_template: null
 publish_docs_to_pulpprojectdotorg: true
+pulp_scheme: https
 pulp_settings:
   allowed_export_paths:
   - /tmp
   allowed_import_paths:
   - /tmp
+  orphan_protection_time: 0
 pulpcore_branch: null
 pulpcore_pip_version_specifier: null
+pulpcore_revision: null
 pulpprojectdotorg_key_id: d1a778bda808
 pydocstyle: true
 pypi_username: pulp
+python_version: '3.8'
 redmine_project: pulp
+release_email: pulp-infra@redhat.com
+release_user: pulpbot
 stable_branch: null
+sync_ci: true
 test_bindings: true
 test_cli: true
 test_fips_nightly: false
 test_performance: false
 test_released_plugin_with_next_pulpcore_release: false
 test_s3: true
-travis_addtl_services: []
-travis_notifications:
-  irc:
-    channels:
-    - chat.freenode.net#pulp-build
-    on_failure: always
-    on_success: change
-    template:
-    - '%{repository_slug}#%{build_number} (%{branch} - %{commit} : %{author} : %{commit_subject})'
-    - 'Change view : %{compare_url}'
-    - 'Build details : %{build_url}'
-    - '%{message}'
 update_redmine: true
+upgrade_range:
+- pulp-certguard_branch: 1.2
+  pulp_file_branch: 1.6
+  pulpcore_branch: 3.11
 

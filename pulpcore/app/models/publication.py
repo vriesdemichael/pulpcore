@@ -1,13 +1,15 @@
-from gettext import gettext as _
-
 from django.db import IntegrityError, models, transaction
+from django_lifecycle import hook, AFTER_UPDATE, BEFORE_DELETE
 
 from .base import MasterModel, BaseModel
 from .content import Artifact, Content, ContentArtifact
 from .repository import Remote, Repository, RepositoryVersion
 from .task import CreatedResource
 from pulpcore.app.files import PulpTemporaryUploadedFile
-from pulpcore.app.loggers import deprecation_logger
+from pulpcore.cache import Cache
+from dynaconf import settings
+from rest_framework.exceptions import APIException
+from pulpcore.app.models import AutoAddObjPermsMixin, AutoDeleteObjPermsMixin
 
 
 class PublicationQuerySet(models.QuerySet):
@@ -125,6 +127,30 @@ class Publication(MasterModel):
             Deletes the Task.created_resource when complete is False.
         """
         with transaction.atomic():
+            # invalidate cache
+            if settings.CACHE_ENABLED:
+                # Find any publications being served directly
+                base_paths = self.distribution_set.values_list("base_path", flat=True)
+                # Find any publications being served indirectly by auto-distribute feature
+                # It's possible for errors to occur before any publication has been completed,
+                # so we need to handle the case when no Publication exists.
+                try:
+                    versions = self.repository.versions.all()
+                    pubs = Publication.objects.filter(
+                        repository_version__in=versions, complete=True
+                    )
+                    publication = pubs.latest("repository_version", "pulp_created")
+                    if self.pk == publication.pk:
+                        base_paths |= self.repository.distributions.values_list(
+                            "base_path", flat=True
+                        )
+                except Publication.DoesNotExist:
+                    pass
+
+                # Invalidate cache for all distributions serving this publication
+                if base_paths:
+                    Cache().delete(base_key=base_paths)
+
             CreatedResource.objects.filter(object_id=self.pk).delete()
             super().delete(**kwargs)
 
@@ -160,7 +186,14 @@ class Publication(MasterModel):
             exc_tb (types.TracebackType): (optional) stack trace.
         """
         if exc_val:
-            self.delete()
+            # If an exception got us here, the Publication we were trying to create is
+            # Bad, and we should delete the attempt. HOWEVER - some exceptions happen before we
+            # even get that far. In those cases, calling delete() results in a new not-very-useful
+            # exception being raised and reported to the user, rather than the actual problem.
+            try:
+                self.delete()
+            except Exception:
+                raise exc_val.with_traceback(exc_tb)
         else:
             try:
                 self.finalize_new_publication()
@@ -169,6 +202,14 @@ class Publication(MasterModel):
             except Exception:
                 self.delete()
                 raise
+
+            # invalidate cache
+            if settings.CACHE_ENABLED:
+                base_paths = Distribution.objects.filter(
+                    repository=self.repository_version.repository
+                ).values_list("base_path", flat=True)
+                if base_paths:
+                    Cache().delete(base_key=base_paths)
 
 
 class PublishedArtifact(BaseModel):
@@ -278,12 +319,63 @@ class ContentGuard(MasterModel):
         Authorize the specified web request.
 
         Args:
-            request (django.http.HttpRequest): A request for a published file.
+            request (aiohttp.web.Request): A request for a published file.
 
         Raises:
             PermissionError: When not authorized.
         """
         raise NotImplementedError()
+
+    @hook(BEFORE_DELETE)
+    def invalidate_cache(self):
+        if settings.CACHE_ENABLED:
+            base_paths = self.distribution_set.values_list("base_path", flat=True)
+            if base_paths:
+                Cache().delete(base_key=base_paths)
+
+
+class RBACContentGuard(ContentGuard, AutoAddObjPermsMixin, AutoDeleteObjPermsMixin):
+    """
+    A content guard that protects content based on RBAC permissions.
+    """
+
+    ACCESS_POLICY_VIEWSET_NAME = "contentguards/core/rbac"
+    TYPE = "rbac"
+
+    def permit(self, request):
+        """
+        Authorize the specified web request. Expects the request to have already been authenticated.
+        """
+        if not (drequest := request.get("drf_request", None)):
+            raise PermissionError("Content app didn't properly authenticate this request")
+        from pulpcore.app.viewsets import RBACContentGuardViewSet
+
+        view = RBACContentGuardViewSet()
+        setattr(view, "get_object", lambda: self)
+        setattr(view, "action", "download")
+        try:
+            view.check_permissions(drequest)
+        except APIException as e:
+            raise PermissionError(e)
+
+    def add_can_download(self, users, groups):
+        """
+        Adds the can_download permission to users & groups upon content guard creation
+        """
+        if users:
+            self.add_for_users("core.download_rbaccontentguard", users)
+        if groups:
+            self.add_for_groups("core.download_rbaccontentguard", groups)
+
+    def remove_can_download(self, users, groups):
+        if users:
+            self.remove_for_users("core.download_rbaccontentguard", users)
+        if groups:
+            self.remove_for_groups("core.download_rbaccontentguard", groups)
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"
+        permissions = (("download_rbaccontentguard", "Can Download Content"),)
 
 
 class BaseDistribution(MasterModel):
@@ -316,38 +408,10 @@ class BaseDistribution(MasterModel):
     remote = models.ForeignKey(Remote, null=True, on_delete=models.SET_NULL)
 
     def __init__(self, *args, **kwargs):
-        """Initialize a BaseDistribution and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "BaseDistribution is deprecated and could be removed as early as pulpcore==3.13; "
-                "use pulpcore.plugin.models.Distribution instead."
-            )
+        raise Exception(
+            "BaseDistribution is no longer supported. "
+            "Please use pulpcore.plugin.models.Distribution instead."
         )
-        return super().__init__(*args, **kwargs)
-
-    def content_handler(self, path):
-        """
-        Handler to serve extra, non-Artifact content for this Distribution
-
-        Args:
-            path (str): The path being requested
-        Returns:
-            None if there is no content to be served at path. Otherwise a
-            aiohttp.web_response.Response with the content.
-        """
-        return None
-
-    def content_handler_list_directory(self, rel_path):
-        """
-        Generate the directory listing entries for content_handler
-
-        Args:
-            rel_path (str): relative path inside the distribution's base_path. For example,
-            the root of the base_path is '', a subdir within the base_path is 'subdir/'.
-        Returns:
-            Set of strings for the extra entries in rel_path
-        """
-        return set()
 
 
 class Distribution(MasterModel):
@@ -379,6 +443,9 @@ class Distribution(MasterModel):
             served.
         repository_version (models.ForeignKey): RepositoryVersion to be served.
     """
+
+    # If distribution serves publications, set by subclasses for proper handling in content app
+    SERVE_FROM_PUBLICATION = False
 
     name = models.TextField(db_index=True, unique=True)
     base_path = models.TextField(unique=True)
@@ -415,35 +482,21 @@ class Distribution(MasterModel):
         """
         return set()
 
-
-class PublicationDistribution(BaseDistribution):
-    """
-    Define how Pulp's content app will serve a Publication.
-
-    Relations:
-        publication (models.ForeignKey): Publication to be served.
-    """
-
-    publication = models.ForeignKey(Publication, null=True, on_delete=models.SET_NULL)
-
-    class Meta:
-        abstract = True
-
-
-class RepositoryVersionDistribution(BaseDistribution):
-    """
-    Define how Pulp's content app will serve a RepositoryVersion or Repository.
-
-    The ``repository`` and ``repository_version`` fields cannot be used together.
-
-    Relations:
-        repository (models.ForeignKey): The latest RepositoryVersion for this Repository will be
-            served.
-        repository_version (models.ForeignKey): RepositoryVersion to be served.
-    """
-
-    repository = models.ForeignKey(Repository, null=True, on_delete=models.SET_NULL)
-    repository_version = models.ForeignKey(RepositoryVersion, null=True, on_delete=models.SET_NULL)
-
-    class Meta:
-        abstract = True
+    @hook(BEFORE_DELETE)
+    @hook(
+        AFTER_UPDATE,
+        when_any=[
+            "base_path",
+            "content_guard",
+            "publication",
+            "remote",
+            "repository",
+            "repository_version",
+        ],
+        has_changed=True,
+    )
+    def invalidate_cache(self):
+        """Invalidates the cache if enabled."""
+        if settings.CACHE_ENABLED:
+            Cache().delete(base_key=self.base_path)
+            # Can also preload cache here possibly

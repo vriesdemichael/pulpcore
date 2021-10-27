@@ -1,9 +1,9 @@
 from gettext import gettext as _
-import uuid
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.core.exceptions import FieldError
+from django.db import IntegrityError
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -14,7 +14,6 @@ from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
 
-from pulpcore.app.access_policy import AccessPolicyFromDB
 from pulpcore.app.viewsets import BaseFilterSet, NamedModelViewSet
 from pulpcore.app.serializers.user import (
     GroupSerializer,
@@ -107,7 +106,6 @@ class GroupViewSet(
     serializer_class = GroupSerializer
     queryset = Group.objects.all()
     ordering = ("name",)
-    permission_classes = (AccessPolicyFromDB,)
     queryset_filtering_required_permission = "auth.view_group"
 
     DEFAULT_ACCESS_POLICY = {
@@ -265,17 +263,18 @@ class GroupObjectPermissionViewSet(NamedModelViewSet):
     pulp_model_alias = "ObjectPermission"
 
     def get_object_pk(self, request):
-        """Get object pk."""
+        """Return an object's pk from the request."""
 
         if "obj" not in request.data:
             raise ValidationError(_("Please provide 'obj' value"))
-        try:
-            obj_pk = request.data["obj"].strip("/").split("/")[-1]
-            uuid.UUID(obj_pk)
-        except (AttributeError, ValueError):
-            raise ValidationError(_("Invalid value for 'obj': {obj}").format(request.data["obj"]))
 
-        return obj_pk
+        obj_url = request.data["obj"]
+        try:
+            obj = NamedModelViewSet.get_resource(obj_url)
+        except ValidationError:
+            raise ValidationError(_("Invalid value for 'obj': {}.").format(obj_url))
+
+        return obj.pk
 
     def get_model_permission(self, request):
         """Get model permission"""
@@ -338,7 +337,12 @@ class GroupObjectPermissionViewSet(NamedModelViewSet):
             content_type_id=permission.content_type_id,
             object_pk=object_pk,
         )
-        object_permission.save()
+
+        try:
+            object_permission.save()
+        except IntegrityError:
+            raise ValidationError(_("The assigned permission already exists."))
+
         serializer = PermissionSerializer(
             object_permission, context={"group_pk": group_pk, "request": request}
         )
@@ -369,7 +373,6 @@ class GroupUserViewSet(NamedModelViewSet):
     parent_lookup_kwargs = {"group_pk": "groups__pk"}
     serializer_class = GroupUserSerializer
     queryset = User.objects.all()
-    permission_classes = (AccessPolicyFromDB,)
 
     DEFAULT_ACCESS_POLICY = {
         "statements": [

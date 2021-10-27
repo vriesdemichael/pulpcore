@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import copy
 from gettext import gettext as _
+from multidict import MultiDict
 import platform
 from pkg_resources import get_distribution
 import ssl
@@ -14,8 +15,6 @@ import aiohttp
 
 from .http import HttpDownloader
 from .file import FileDownloader
-
-import json
 
 
 PROTOCOL_MAP = {
@@ -75,6 +74,8 @@ class DownloaderFactory:
                 is the downloader class to be used for that scheme, e.g.
                 {'https': MyCustomDownloader}. These override the default values.
         """
+        download_concurrency = remote.download_concurrency or remote.DEFAULT_DOWNLOAD_CONCURRENCY
+
         self._remote = remote
         self._download_class_map = copy.copy(PROTOCOL_MAP)
         if downloader_overrides:
@@ -86,7 +87,7 @@ class DownloaderFactory:
             "file": self._generic,
         }
         self._session = self._make_aiohttp_session_from_remote()
-        self._semaphore = asyncio.Semaphore(value=remote.download_concurrency)
+        self._semaphore = asyncio.Semaphore(value=download_concurrency)
         atexit.register(self._session_cleanup)
 
     def _session_cleanup(self):
@@ -124,9 +125,13 @@ class DownloaderFactory:
         if sslcontext:
             tcp_conn_opts["ssl_context"] = sslcontext
 
-        headers = {"User-Agent": user_agent()}
+        headers = MultiDict({"User-Agent": user_agent()})
         if self._remote.headers is not None:
-            headers.update(json.loads(self._remote.headers))
+            for header_dict in self._remote.headers:
+                user_agent_header = header_dict.pop("User-Agent", None)
+                if user_agent_header:
+                    headers["User-Agent"] = f"{headers['User-Agent']}, {user_agent_header}"
+                headers.extend(header_dict)
 
         conn = aiohttp.TCPConnector(**tcp_conn_opts)
         total = self._remote.total_timeout
@@ -155,6 +160,12 @@ class DownloaderFactory:
             is configured with the remote settings.
         """
         kwargs["semaphore"] = self._semaphore
+        kwargs["max_retries"] = (
+            kwargs.get("max_retries")
+            or self._remote.max_retries
+            or self._remote.DEFAULT_MAX_RETRIES
+        )
+
         scheme = urlparse(url).scheme.lower()
         try:
             builder = self._handler_map[scheme]

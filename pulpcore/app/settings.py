@@ -17,6 +17,7 @@ from logging import getLogger
 from pathlib import Path
 from pkg_resources import iter_entry_points
 
+from cryptography.fernet import Fernet
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
 
@@ -46,14 +47,18 @@ STATIC_ROOT = DEPLOY_ROOT / STATIC_URL.strip("/")
 
 DEFAULT_FILE_STORAGE = "pulpcore.app.models.storage.FileSystem"
 
-FILE_UPLOAD_TEMP_DIR = DEPLOY_ROOT / "tmp"
-WORKING_DIRECTORY = FILE_UPLOAD_TEMP_DIR
+WORKING_DIRECTORY = DEPLOY_ROOT / "tmp"
+FILE_UPLOAD_TEMP_DIR = WORKING_DIRECTORY
+
 CHUNKED_UPLOAD_DIR = "upload"
 
 # List of upload handler classes to be applied in order.
 FILE_UPLOAD_HANDLERS = ("pulpcore.app.files.HashingFileUploadHandler",)
 
 SECRET_KEY = True
+
+# Key used to encrypt fields in the database
+DB_ENCRYPTION_KEY = "/etc/pulp/certs/database_fields.symmetric.key"
 
 # Application definition
 
@@ -98,7 +103,7 @@ for app in OPTIONAL_APPS:
         INSTALLED_APPS.append(app)
 
 MIDDLEWARE = [
-    "django_guid.middleware.GuidMiddleware",
+    "django_guid.middleware.guid_middleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -144,7 +149,7 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": ("django_filters.rest_framework.DjangoFilterBackend",),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
     "PAGE_SIZE": 100,
-    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAdminUser",),
+    "DEFAULT_PERMISSION_CLASSES": ("pulpcore.plugin.access_policy.AccessPolicyFromDB",),
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.BasicAuthentication",
@@ -229,18 +234,31 @@ CONTENT_APP_TTL = 30
 
 WORKER_TTL = 30
 
+# how long to protect orphan content in minutes
+ORPHAN_PROTECTION_TIME = 24 * 60
+
 REMOTE_USER_ENVIRON_NAME = "REMOTE_USER"
 
 ALLOWED_IMPORT_PATHS = []
 
 ALLOWED_EXPORT_PATHS = []
 
+USE_NEW_WORKER_TYPE = True
+ALLOW_SHARED_TASK_RESOURCES = False
+
 PROFILE_STAGES_API = False
+
+# https://docs.pulpproject.org/pulpcore/configuration/settings.html#pulp-cache
+CACHE_ENABLED = True
+CACHE_SETTINGS = {
+    "EXPIRES_TTL": 600,  # 10 minutes
+}
 
 SPECTACULAR_SETTINGS = {
     "SERVE_URLCONF": ROOT_URLCONF,
     "DEFAULT_GENERATOR_CLASS": "pulpcore.openapi.PulpSchemaGenerator",
     "DEFAULT_SCHEMA_CLASS": "pulpcore.openapi.PulpAutoSchema",
+    "ENUM_ADD_EXPLICIT_BLANK_NULL_CHOICE": False,
     "COMPONENT_SPLIT_REQUEST": True,
     "COMPONENT_NO_READ_ONLY_REQUIRED": True,
     "GENERIC_ADDITIONAL_PROPERTIES": None,
@@ -264,6 +282,8 @@ SPECTACULAR_SETTINGS = {
 # NOTE: specifying checksums that are not listed under ALL_KNOWN_CONTENT_CHECKSUMS will fail
 #       at startup
 ALLOWED_CONTENT_CHECKSUMS = ["sha224", "sha256", "sha384", "sha512"]
+
+DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 # HERE STARTS DYNACONF EXTENSION LOAD (Keep at the very bottom of settings.py)
 # Read more at https://dynaconf.readthedocs.io/en/latest/guides/django.html
@@ -293,6 +313,20 @@ except NameError:
             "the installer automatically."
         )
     )
+
+if not (
+    Path(sys.argv[0]).name == "sphinx-build"
+    or (len(sys.argv) >= 2 and sys.argv[1] == "collectstatic")
+):
+    try:
+        with open(DB_ENCRYPTION_KEY, "rb") as key_file:
+            Fernet(key_file.read())
+    except Exception as ex:
+        raise ImproperlyConfigured(
+            _("Could not load DB_ENCRYPTION_KEY file '{file}': {err}").format(
+                file=DB_ENCRYPTION_KEY, err=ex
+            )
+        )
 
 # Check legality of ALLOWED_CONTENT_CHECKSUMS post-dynaconf-load, in case it has been overridden
 # in a site-specific location (eg, in /etc/pulp/settings.py)

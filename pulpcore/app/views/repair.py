@@ -14,6 +14,7 @@ class RepairView(APIView):
             "or corrupted artifacts, and attempts to redownload them."
         ),
         summary="Repair Artifact Storage",
+        request=RepairSerializer,
         responses={202: AsyncOperationResponseSerializer},
     )
     def post(self, request):
@@ -25,6 +26,6 @@ class RepairView(APIView):
 
         verify_checksums = serializer.validated_data["verify_checksums"]
 
-        task = dispatch(repair_all_artifacts, [], args=[verify_checksums])
+        task = dispatch(repair_all_artifacts, args=[verify_checksums])
 
         return OperationPostponedResponse(task, request)

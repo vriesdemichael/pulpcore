@@ -78,8 +78,8 @@ Tasks
 -----
 
 Any action that can run for a long time should be an asynchronous task. Plugin writers do not need
-to understand the internals of the pulpcore tasking system, workers automatically execute tasks from
-RQ, including tasks deployed by plugins.
+to understand the internals of the pulpcore tasking system. Workers automatically execute tasks,
+including the ones deployed by plugins.
 
 
 **Worker and Tasks Directories**
@@ -400,8 +400,8 @@ In 3.8 the following changes happen:
 2. The existing method signature ``def foo(a, b)`` is left in-tact.
 3. The ``foo`` method would have the a Python ``DeprecationWarning`` added to it such as::
 
-    from pulpcore.app.logging import deprecation_logger
-    deprecation_logger.warn("foo() is deprecated and will be removed in pulpcore==3.9; use the_new_foo().")
+    from pulpcore.app.loggers import deprecation_logger
+    deprecation_logger.warning("foo() is deprecated and will be removed in pulpcore==3.9; use the_new_foo().")
 
 4. A ``CHANGES/plugin_api/XXXX.deprecation`` changelog entry is created explaining how to port
    plugin code onto the new call interface.
@@ -439,7 +439,7 @@ Logging of deprecation warnings can be disabled by raising the log level for the
 Installation
 ------------
 
-It's recommended to use the `Pulp 3 Installer <https://pulp-installer.readthedocs.io/>`_ to install
+It's recommended to use the `Pulp 3 Installer <https://docs.pulpproject.org/pulp_installer/>`_ to install
 your plugin. Generally you can do this by configuring ``pulp_install_plugins`` variable with your
 Python package's name. For example for ``pulp-file``::
 
@@ -466,8 +466,8 @@ galaxy_ui.yml task <https://github.com/pulp/pulp_installer/blob/master/roles/pul
 galaxy_ui.yml>`_ in the installers ``pulp_devel`` role.
 
 For help contributing or changing a plugin-specific installation, please reach out to the installer
-maintainers either through the developer mailing list (``pulp-dev@redhat.com``) or on Freenode in
-the developer channel, ``#pulp-dev``.
+maintainers. Check out `our help page <https://pulpproject.org/help/>`_ for different ways to
+contact us.
 
 .. _checksum-use-in-plugins:
 

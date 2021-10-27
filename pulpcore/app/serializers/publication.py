@@ -1,11 +1,11 @@
 from gettext import gettext as _
 
 from django.db.models import Q
+from guardian.shortcuts import get_users_with_perms, get_groups_with_perms
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
 
 from pulpcore.app import models
-from pulpcore.app.loggers import deprecation_logger
 from pulpcore.app.serializers import (
     BaseURLField,
     DetailIdentityField,
@@ -15,6 +15,7 @@ from pulpcore.app.serializers import (
     RepositoryVersionRelatedField,
     validate_unknown_fields,
 )
+from pulpcore.app.serializers.user import GroupUserSerializer, GroupSerializer
 
 
 class PublicationSerializer(ModelSerializer):
@@ -76,107 +77,39 @@ class ContentGuardSerializer(ModelSerializer):
         fields = ModelSerializer.Meta.fields + ("name", "description")
 
 
-class BasePathOverlapMixin:
-    """An mixin that checks `BaseDistribution` and `Distribution` for overlapping base paths"""
+class RBACContentGuardSerializer(ContentGuardSerializer):
 
-    def _validate_path_overlap_per_model_cls(self, path, model_cls):
-        # look for any base paths nested in path
-        search = path.split("/")[0]
-        q = Q(base_path=search)
-        for subdir in path.split("/")[1:]:
-            search = "/".join((search, subdir))
-            q |= Q(base_path=search)
+    users = serializers.SerializerMethodField()
+    groups = serializers.SerializerMethodField()
 
-        # look for any base paths that nest path
-        q |= Q(base_path__startswith="{}/".format(path))
-        qs = model_cls.objects.filter(q)
-
-        if self.instance is not None and isinstance(self.instance, model_cls):
-            qs = qs.exclude(pk=self.instance.pk)
-
-        match = qs.first()
-        if match:
-            raise serializers.ValidationError(
-                detail=_("Overlaps with existing distribution '{}'").format(match.name)
-            )
-
-        return path
-
-    def validate_base_path(self, path):
-        self._validate_relative_path(path)
-        self._validate_path_overlap_per_model_cls(path, models.BaseDistribution)
-        return self._validate_path_overlap_per_model_cls(path, models.Distribution)
-
-
-class BaseDistributionSerializer(ModelSerializer, BasePathOverlapMixin):
-    """
-    The Serializer for the BaseDistribution model.
-
-    The serializer deliberately omits the "remote" field, which is used for
-    pull-through caching only. Plugins implementing pull-through caching will
-    have to add the field in their derived serializer class like this::
-
-      remote = DetailRelatedField(
-          required=False,
-          help_text=_('Remote that can be used to fetch content when using pull-through caching.'),
-          queryset=models.Remote.objects.all(),
-          allow_null=True
-      )
-
-    """
-
-    pulp_href = DetailIdentityField(view_name_pattern=r"distributions(-.*/.*)-detail")
-    pulp_labels = LabelsField(required=False)
-    base_path = serializers.CharField(
-        help_text=_(
-            'The base (relative) path component of the published url. Avoid paths that \
-                    overlap with other distribution base paths (e.g. "foo" and "foo/bar")'
-        ),
-        validators=[UniqueValidator(queryset=models.BaseDistribution.objects.all())],
-    )
-    base_url = BaseURLField(
-        source="base_path",
-        read_only=True,
-        help_text=_("The URL for accessing the publication as defined by this distribution."),
-    )
-    content_guard = DetailRelatedField(
-        required=False,
-        help_text=_("An optional content-guard."),
-        view_name_pattern=r"contentguards(-.*/.*)?-detail",
-        queryset=models.ContentGuard.objects.all(),
-        allow_null=True,
-    )
-    name = serializers.CharField(
-        help_text=_("A unique name. Ex, `rawhide` and `stable`."),
-        validators=[
-            UniqueValidator(queryset=models.BaseDistribution.objects.all()),
-            UniqueValidator(queryset=models.Distribution.objects.all()),
-        ],
-    )
-
-    def __init__(self, *args, **kwargs):
-        """Initialize a BaseDistributionSerializer and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "BaseDistributionSerializer is deprecated and could be removed as early as "
-                "pulpcore==3.13; use pulpcore.plugin.serializers.DistributionSerializer instead."
-            )
+    def get_users(self, obj):
+        """Finds all the users with this object's download permission."""
+        users = get_users_with_perms(
+            obj, with_group_users=False, only_with_perms_in=["download_rbaccontentguard"]
         )
-        return super().__init__(*args, **kwargs)
+        return GroupUserSerializer(users, many=True, context=self.context).data
+
+    def get_groups(self, obj):
+        """Finds all the groups with this object's download permission."""
+        groups = get_groups_with_perms(obj, attach_perms=True)
+        return GroupSerializer(
+            (group for group, perms in groups.items() if "download_rbaccontentguard" in perms),
+            many=True,
+            context=self.context,
+        ).data
 
     class Meta:
-        abstract = True
-        model = models.BaseDistribution
-        fields = ModelSerializer.Meta.fields + (
-            "base_path",
-            "base_url",
-            "content_guard",
-            "pulp_labels",
-            "name",
-        )
+        model = models.RBACContentGuard
+        fields = ContentGuardSerializer.Meta.fields + ("users", "groups")
 
 
-class DistributionSerializer(ModelSerializer, BasePathOverlapMixin):
+class RBACContentGuardPermissionSerializer(serializers.Serializer):
+
+    usernames = serializers.ListField(default=[])
+    groupnames = serializers.ListField(default=[])
+
+
+class DistributionSerializer(ModelSerializer):
     """
     The Serializer for the Distribution model.
 
@@ -220,6 +153,7 @@ class DistributionSerializer(ModelSerializer, BasePathOverlapMixin):
             'The base (relative) path component of the published url. Avoid paths that \
                     overlap with other distribution base paths (e.g. "foo" and "foo/bar")'
         ),
+        validators=[UniqueValidator(queryset=models.Distribution.objects.all())],
     )
     base_url = BaseURLField(
         source="base_path",
@@ -236,7 +170,6 @@ class DistributionSerializer(ModelSerializer, BasePathOverlapMixin):
     name = serializers.CharField(
         help_text=_("A unique name. Ex, `rawhide` and `stable`."),
         validators=[
-            UniqueValidator(queryset=models.BaseDistribution.objects.all()),
             UniqueValidator(queryset=models.Distribution.objects.all()),
         ],
     )
@@ -250,7 +183,7 @@ class DistributionSerializer(ModelSerializer, BasePathOverlapMixin):
 
     class Meta:
         abstract = True
-        model = models.BaseDistribution
+        model = models.Distribution
         fields = ModelSerializer.Meta.fields + (
             "base_path",
             "base_url",
@@ -260,107 +193,68 @@ class DistributionSerializer(ModelSerializer, BasePathOverlapMixin):
             "repository",
         )
 
-    def validate(self, data):
-        super().validate(data)
+    def _validate_path_overlap(self, path):
+        # look for any base paths nested in path
+        search = path.split("/")[0]
+        q = Q(base_path=search)
+        for subdir in path.split("/")[1:]:
+            search = "/".join((search, subdir))
+            q |= Q(base_path=search)
 
-        publication_in_data = "publication" in data
-        repository_version_in_data = "repository_version" in data
-        publication_in_instance = self.instance.publication if self.instance else None
-        repository_version_in_instance = self.instance.repository_version if self.instance else None
+        # look for any base paths that nest path
+        q |= Q(base_path__startswith="{}/".format(path))
+        qs = models.Distribution.objects.filter(q)
 
-        if publication_in_data and repository_version_in_data:
-            error = True
-        elif publication_in_data and repository_version_in_instance:
-            error = True
-        elif publication_in_instance and repository_version_in_data:
-            error = True
-        else:
-            error = False
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
 
-        if error:
-            msg = _(
-                "Only one of the attributes 'publication' and 'repository_version' may be used "
-                "simultaneously."
+        match = qs.first()
+        if match:
+            raise serializers.ValidationError(
+                detail=_("Overlaps with existing distribution '{}'").format(match.name)
             )
-            raise serializers.ValidationError(msg)
 
-        return data
+        return path
 
-
-class PublicationDistributionSerializer(BaseDistributionSerializer):
-    publication = DetailRelatedField(
-        required=False,
-        help_text=_("Publication to be served"),
-        view_name_pattern=r"publications(-.*/.*)?-detail",
-        queryset=models.Publication.objects.exclude(complete=False),
-        allow_null=True,
-    )
-
-    def __init__(self, *args, **kwargs):
-        """Initialize a PublicationDistributionSerializer and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "PublicationDistributionSerializer is deprecated and could be removed as early as "
-                "pulpcore==3.13; use pulpcore.plugin.serializers.DistributionSerializer instead. "
-                "See its docstring for more details."
-            )
-        )
-        return super().__init__(*args, **kwargs)
-
-    class Meta:
-        abstract = True
-        fields = BaseDistributionSerializer.Meta.fields + ("publication",)
-
-
-class RepositoryVersionDistributionSerializer(BaseDistributionSerializer):
-    repository = DetailRelatedField(
-        required=False,
-        help_text=_("The latest RepositoryVersion for this Repository will be served."),
-        view_name_pattern=r"repositories(-.*/.*)?-detail",
-        queryset=models.Repository.objects.all(),
-        allow_null=True,
-    )
-    repository_version = RepositoryVersionRelatedField(
-        required=False, help_text=_("RepositoryVersion to be served"), allow_null=True
-    )
-
-    def __init__(self, *args, **kwargs):
-        """Initialize a RepositoryVersionDistributionSerializer and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "PublicationDistributionSerializer is deprecated and could be removed as early as "
-                "pulpcore==3.13; use pulpcore.plugin.serializers.DistributionSerializer instead. "
-                "See its docstring for more details."
-            )
-        )
-        return super().__init__(*args, **kwargs)
-
-    class Meta:
-        abstract = True
-        fields = BaseDistributionSerializer.Meta.fields + ("repository", "repository_version")
+    def validate_base_path(self, path):
+        self._validate_relative_path(path)
+        return self._validate_path_overlap(path)
 
     def validate(self, data):
         super().validate(data)
 
-        repository_in_data = "repository" in data
-        repository_version_in_data = "repository_version" in data
-        repository_in_instance = self.instance.repository if self.instance else None
-        repository_version_in_instance = self.instance.repository_version if self.instance else None
+        repository_provided = data.get("repository", None) or (
+            self.instance and self.instance.repository
+        )
+        repository_version_provided = data.get("repository_version", None) or (
+            self.instance and self.instance.repository_version
+        )
+        publication_provided = data.get("publication", None) or (
+            self.instance and self.instance.publication
+        )
 
-        if repository_in_data and repository_version_in_data:
-            error = True
-        elif repository_in_data and repository_version_in_instance:
-            error = True
-        elif repository_in_instance and repository_version_in_data:
-            error = True
-        else:
-            error = False
-
-        if error:
-            msg = _(
-                "Only one of the attributes 'publication' and 'repository_version' may be used "
-                "simultaneously."
+        if publication_provided and repository_version_provided:
+            raise serializers.ValidationError(
+                _(
+                    "Only one of the attributes 'publication' and 'repository_version' "
+                    "may be used simultaneously."
+                )
             )
-            raise serializers.ValidationError(msg)
+        elif repository_provided and repository_version_provided:
+            raise serializers.ValidationError(
+                _(
+                    "Only one of the attributes 'repository' and 'repository_version' "
+                    "may be used simultaneously."
+                )
+            )
+        # TODO: https://pulp.plan.io/issues/8762
+
+        # elif repository_provided and publication_provided:
+        #     raise serializers.ValidationError(
+        #         _(
+        #             "Only one of the attributes 'repository' and 'publication' "
+        #             "may be used simultaneously."
+        #         )
+        #     )
 
         return data

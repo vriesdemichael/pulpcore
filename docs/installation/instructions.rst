@@ -1,10 +1,10 @@
-Installation Instructions
-=========================
+Instructions
+============
 
 Supported Platforms
 -------------------
 
-Pulp should work on any operating system that can provide a Python 3.6+ runtime environment and
+Pulp should work on any operating system that can provide a Python 3.8+ runtime environment and
 the supporting dependencies e.g. a database. Pulp has been demonstrated to work on Ubuntu, Debian,
 Fedora, CentOS, and Mac OSX.
 
@@ -23,7 +23,7 @@ The Pulp 3 Ansible Installer is a collection of Ansible roles designed to automa
 You can customize and configure your Pulp deployment through the Ansible variables for each role.
 
 For comprehensive and up-to-date instructions about using the Pulp Ansible installer, see the
-`Pulp Installer documentation <https://pulp-installer.readthedocs.io/>`__.
+`Pulp Installer documentation <https://docs.pulpproject.org/pulp_installer/>`__.
 
 
 PyPI Installation
@@ -33,11 +33,11 @@ PyPI Installation
 
    * name: pulp
    * shell: The path to the `nologin` executable
-   * home: ``MEDIA_ROOT``
+   * home: ``DEPLOY_ROOT``
    * system account: yes
    * create corresponding private group: yes
 
-2. Install python3.6(+) and pip.
+2. Install python3.8(+) and pip.
 
 3. Create a pulp venv::
 
@@ -83,6 +83,12 @@ PyPI Installation
     ``DJANGO_SETTINGS_MODULE="pulpcore.app.settings"``. You can use it anywhere you would normally
     use ``manage.py``.
 
+.. warning::
+
+    You should never attempt to create new migrations via the ``pulpcore-manager makemigrations``.
+    In case, new migrations would be needed, please file a bug against the respective plugin.
+    :ref:`issue-writing`
+
 .. note::
 
     In place of using the systemd unit files provided in the `systemd-setup` section, you can run
@@ -111,12 +117,18 @@ PostgreSQL.
 PostgreSQL
 ^^^^^^^^^^
 
+Installation package considerations
+***********************************
+
 To install PostgreSQL, refer to the package manager or the
-`PostgreSQL install docs <http://postgresguide.com/setup/install.html>`_. Oftentimes you can also find better
+`PostgreSQL install docs <http://postgresguide.com/setup/install.html>`_. Oftentimes, you can also find better
 installation instructions for your particular operating system from third-parties such as Digital Ocean.
 
 On Ubuntu and Debian, the package to install is named ``postgresql``. On Fedora and CentOS, the package
 is named ``postgresql-server``.
+
+User and database configuration
+*******************************
 
 The default PostgreSQL user and database name in the provided server.yaml file is ``pulp``. Unless you plan to
 customize the configuration of your Pulp installation, you will need to create this user with the proper permissions
@@ -124,6 +136,14 @@ and also create the ``pulp`` database owned by the ``pulp`` user. If you do choo
 the database options can be configured in the `DATABASES` section of your server.yaml settings file.
 See the `Django database settings documentation <https://docs.djangoproject.com/en/2.2/ref/settings/#databases>`_
 for more information on setting the `DATABASES` values in server.yaml.
+
+UTF-8 encoding
+**************
+
+You must configure PostgreSQL to use UTF-8 character set encoding.
+
+Post-installation setup
+***********************
 
 After installing and configuring PostgreSQL, you should configure it to start at boot, and then start it::
 
@@ -154,7 +174,7 @@ Systemd
 -------
 
 To run the four Pulp services, systemd files needs to be created in /usr/lib/systemd/system/. The
-`Pulp 3 Ansible Installer <https://pulp-installer.readthedocs.io/>`__ makes these for you, but you
+`Pulp 3 Ansible Installer <https://docs.pulpproject.org/pulp_installer/>`__ makes these for you, but you
 can also configure them by hand from the templates below. Custom configuration can be applied using
 the ``Environment`` option with various :ref:`Pulp settings <settings>`.
 
@@ -163,26 +183,23 @@ the ``Environment`` option with various :ref:`Pulp settings <settings>`.
    content to clients. We recommend starting with the `pulpcore-content template <https://github.com
    /pulp/pulp_installer/blob/master/roles/pulp_content/templates/pulpcore-content.service.j2>`_ and
    setting the variables according to the `pulpcore_content config variables documentation <https://
-   github.com/pulp/ pulp_installer/tree/master/roles/pulp_content#variables>`_
+   github.com/pulp/ pulp_installer/tree/master/roles/pulp_content#role-variables>`_
 
 2. Make a ``pulpcore-api.service`` file for the pulpcore-api service which serves the Pulp REST API. We
-   recommend starting with the `pulpcore-api template <https://github.com/pulp/pulp_installer/blob/master/
-   roles/pulp/templates/pulpcore-api.service.j2>`_ and setting the variables according to the `pulpcore-api
-   config variables documentation <https://github.com/pulp/ pulp_installer/tree/master/roles/
-   pulp#variables>`_
+   recommend starting with the `pulpcore-api template <https://github.com/pulp/pulp_installer/blob/master/roles/pulp_api/templates/pulpcore-api.service.j2>`_
+   and setting the variables according to the `pulpcore-api config variables documentation <https://github.com/pulp/pulp_installer/tree/master/roles/pulp_api#role-variables>`_
 
 3. Make a ``pulpcore-worker@.service`` file for the pulpcore-worker processes which allows you to manage
    one or more workers. We recommend starting with the `pulpcore-worker template <https://github.com/pulp/
    pulp_installer/blob/master/roles/pulp_workers/templates/pulpcore-worker%40.service.j2>`_ and setting
    the variables according to the `pulp_workers config variables documentation <https://github.com/
-   pulp/pulp_installer/tree/master/roles/pulp_workers#configurable-variables>`_
+   pulp/pulp_installer/tree/master/roles/pulp_workers#role-variables>`_
 
 4. Make a ``pulpcore-resource-manager.service`` file which can manage one pulpcore-resource-manager
    process. We recommend starting with the `pulpcore-resource-manager template <https://github.com/pulp/
    pulp_installer/blob/master/roles/pulp_resource_manager/templates/pulpcore-resource-manager.service.
    j2>`_ and setting the variables according to the `pulp_resource_manager config variables
-   documentation <https://github.com/pulp/pulp_installer/tree/master/roles/pulp_resource_manager#
-   configurable-variables>`_
+   documentation <https://github.com/pulp/pulp_installer/tree/master/roles/pulp_resource_manager#role-variables>`_
 
 These services can then be started by running::
 
@@ -216,4 +233,4 @@ certificates for nginx and httpd reverse proxies.
 
 3. The Pulp Installer also supports using services that use the ACME protocol, e.g. https://letsencrypt.org/,  to
    generate trusted SSL certificates. See the Pulp Installer documentation for `instructions and an example playbook
-   <https://pulp-installer.readthedocs.io/en/latest/letsencrypt/>`_.
+   <https://docs.pulpproject.org/pulp_installer/letsencrypt/>`_.

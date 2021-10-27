@@ -1,8 +1,27 @@
 Pulp Documentation
 ==================
 
-This documentation is for `pulpcore`, which is used with plugins to fetch, upload, and organize
-arbitrary content types.
+This is the main landing page for documentation related to Pulp.
+
+The documentation itself is broken into sub categories that provide more granular information and
+workflows.
+
+`pulpcore` handles some parts of common content management workflows, including high performance
+downloading, task queuing with scalable workers, and management of content within versioned
+repositories.
+
+If you are looking for a very high-level overview of Pulp's features, check out `features page at
+pulpproject.org <https://pulpproject.org/features/>`_
+
+If you want an overview of the main concepts and terminology of Pulp, see :doc:`Concepts and Terminology<concepts>`
+
+If you want to understand the core workflows, see  :doc:`Workflows<workflows/index>`
+
+If you want to look at the considerations and requirements for installing Pulp, see
+ :ref:`installation`. If you want to evaluate Pulp quickly, try `Pulp in One
+ Container <https://pulpproject.org/pulp-in-one-container/>`_
+
+If you're looking for documentation specific to a content type, see :doc:`List of Plugins<plugins/index>`
 
 Anyone interested in writing a plugin should reference the :ref:`Plugin API`.
 
@@ -22,6 +41,12 @@ Contributing
 Pulp is a free and open source software (FOSS) project and if you'd like to contribute, please check
 out our :doc:`contributing docs<contributing/index>`.
 
+Found a security issue?
+-----------------------
+
+If you find a security issue or have a security concern, see the :ref:`security-bugs` section for information about how to file a report.
+
+
 Source code
 ^^^^^^^^^^^
 
@@ -29,24 +54,6 @@ Source code
   * `pulpcore <https://github.com/pulp/pulpcore/>`_
   * `plugin repositories <https://pulpproject.org/content-plugins/>`_
 
-
-How to Navigate the pulpcore and plugin docs
---------------------------------------------
-
-Plugin Documentation
-^^^^^^^^^^^^^^^^^^^^
-
-If you are a new user who is evaluating Pulp it is recommended that you skim the documentation for
-the plugins that add the content types you are interested in. Links to these docs can be found in
-our `list of plugins <https://docs.pulpproject.org/pulpcore/plugins/index.html#plugins>`_
-
-Pulpcore Documentation
-^^^^^^^^^^^^^^^^^^^^^^
-
-`pulpcore` handles some parts of common content management workflows, including high performance
-downloading, task queuing with scalable workers, and management of content within versioned
-repositories. Information about :ref:`installation`, :ref:`deployment`, and :doc:`general concepts
-and terminology<concepts>` are all covered by the ``pulpcore`` documentation.
 
 
 Table of Contents
@@ -59,7 +66,8 @@ Table of Contents
    from-pulp-2
    components
    installation/index
-   settings
+   configuration/index
+   authentication/index
    workflows/index
    plugins/index
    rest_api

@@ -249,7 +249,7 @@ This would produce an incremental export of everything that had been added to ou
 between :term:`RepositoryVersion` '1' and the ``current_version`` :term:`RepositoryVersions<RepositoryVersion>`
 of our :term:`Repositories<Repository>`.
 
-Finally, if we need complete comtrol over incremental exporting, we can combine the use of ``start_versions=`` and ``versions=``
+Finally, if we need complete control over incremental exporting, we can combine the use of ``start_versions=`` and ``versions=``
 to produce an incremental export of everything that happened after ``start_versions=`` up to and including ``versions=``::
 
     http POST :${EXPORTER_HREF}exports/                                         \
@@ -333,6 +333,8 @@ to the names of repos in Pulp. For example, suppose the name of the repo in the 
 
     http :/pulp/api/v3/importers/core/pulp/ name="test" repo_mapping:="{\"source\": \"dest\"}"
 
+.. note::
+   Pulp import expects destination repository/repositories to be present at the import process.
 
 After the importer is created, a POST request to create an import will trigger the import process.
 
@@ -385,9 +387,8 @@ proposed import using the ``import-check`` command::
     * repo_mapping is valid JSON
 
 ``import-check`` is a low-overhead synchronous call. It does not attempt to do validations that
-require database access or long-running tasks such as verifying checksums. All parameters are optional. 
+require database access or long-running tasks such as verifying checksums. All parameters are optional.
 
 .. note::
 
     For ``path`` and ``toc``, if the ALLOWED_IMPORT_PATHS check fails, no further information will be given.
-

@@ -8,7 +8,7 @@ with open("requirements.txt") as requirements:
 
 setup(
     name="pulpcore",
-    version="3.13.0",
+    version="3.16.0.dev",
     description="Pulp Django Application and Related Modules",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -17,7 +17,7 @@ setup(
     author="Pulp Team",
     author_email="pulp-list@redhat.com",
     url="https://pulpproject.org",
-    python_requires=">=3.6",
+    python_requires=">=3.8",
     install_requires=requirements,
     extras_require={
         "s3": ["django-storages[boto3]"],
@@ -32,8 +32,8 @@ setup(
         "Framework :: Django",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
     ],
     scripts=["bin/pulp-content"],
     entry_points={

@@ -8,21 +8,22 @@ import logging
 
 import django
 from asyncio_throttle import Throttler
+from dynaconf import settings
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.urls import reverse
-from django_lifecycle import AFTER_SAVE, hook
-
-from django.contrib.postgres.fields import JSONField
+from django_lifecycle import AFTER_UPDATE, BEFORE_DELETE, hook
 
 from pulpcore.app.util import batch_qs, get_view_name_for_model
 from pulpcore.constants import ALL_KNOWN_CONTENT_CHECKSUMS
 from pulpcore.download.factory import DownloaderFactory
 from pulpcore.exceptions import ResourceImmutableError
-from pulpcore.app.loggers import deprecation_logger
+
+from pulpcore.cache import Cache
 
 from .base import MasterModel, BaseModel
 from .content import Artifact, Content
+from .fields import EncryptedTextField
 from .task import CreatedResource, Task
 
 
@@ -39,6 +40,8 @@ class Repository(MasterModel):
         description (models.TextField): An optional description.
         next_version (models.PositiveIntegerField): A record of the next version number to be
             created.
+        retain_repo_versions (models.PositiveIntegerField): Number of repo versions to keep
+        user_hidden (models.BooleanField): Whether to expose this repo to users via the API
 
     Relations:
 
@@ -53,7 +56,8 @@ class Repository(MasterModel):
     name = models.TextField(db_index=True, unique=True)
     description = models.TextField(null=True)
     next_version = models.PositiveIntegerField(default=0)
-    retained_versions = models.PositiveIntegerField(default=None, null=True)
+    retain_repo_versions = models.PositiveIntegerField(default=None, null=True)
+    user_hidden = models.BooleanField(default=False)
     content = models.ManyToManyField(
         "Content", through="RepositoryContent", related_name="repositories"
     )
@@ -127,9 +131,11 @@ class Repository(MasterModel):
                 # now add any content that's in the base_version but not in version
                 version.add_content(base_version.content.exclude(pk__in=version.content))
 
-            if Task.current():
+            if Task.current() and not self.user_hidden:
                 resource = CreatedResource(content_object=version)
                 resource.save()
+
+            self.invalidate_cache()
 
             return version
 
@@ -193,17 +199,28 @@ class Repository(MasterModel):
         """
         return Artifact.objects.filter(content__pk__in=version.content)
 
-    @hook(AFTER_SAVE)
+    @hook(AFTER_UPDATE, when="retain_repo_versions", has_changed=True)
     def cleanup_old_versions(self):
-        """Cleanup old repository versions based on retained_versions."""
-        if self.retained_versions:
-            for version in self.versions.order_by("-number")[self.retained_versions :]:
+        """Cleanup old repository versions based on retain_repo_versions."""
+        if self.retain_repo_versions:
+            for version in self.versions.order_by("-number")[self.retain_repo_versions :]:
                 _logger.info(
                     _("Deleting repository version {} due to version retention limit.").format(
                         version
                     )
                 )
                 version.delete()
+
+    @hook(BEFORE_DELETE)
+    def invalidate_cache(self):
+        """Invalidates the cache if repository is present."""
+        if settings.CACHE_ENABLED:
+            distributions = self.distributions.all()
+            if distributions.exists():
+                base_paths = distributions.values_list("base_path", flat=True)
+                if base_paths:
+                    Cache().delete(base_key=base_paths)
+                # Could do preloading here for immediate artifacts with artifacts_for_version
 
 
 class Remote(MasterModel):
@@ -238,12 +255,13 @@ class Remote(MasterModel):
         username (models.TextField): The username to be used for authentication when syncing.
         password (models.TextField): The password to be used for authentication when syncing.
         download_concurrency (models.PositiveIntegerField): Total number of
-            simultaneous connections.
+            simultaneous connections allowed to any remote during a sync.
         policy (models.TextField): The policy to use when downloading content.
         total_timeout (models.FloatField): Value for aiohttp.ClientTimeout.total on connections
         connect_timeout (models.FloatField): Value for aiohttp.ClientTimeout.connect
         sock_connect_timeout (models.FloatField): Value for aiohttp.ClientTimeout.sock_connect
         sock_read_timeout (models.FloatField): Value for aiohttp.ClientTimeout.sock_read
+        headers (models.JSONField): Headers set on the aiohttp.ClientSession
         rate_limit (models.IntegerField): Limits total download rate in requests per second.
     """
 
@@ -253,6 +271,9 @@ class Remote(MasterModel):
     IMMEDIATE = "immediate"
     ON_DEMAND = "on_demand"
     STREAMED = "streamed"
+
+    DEFAULT_DOWNLOAD_CONCURRENCY = 10
+    DEFAULT_MAX_RETRIES = 3
 
     POLICY_CHOICES = (
         (IMMEDIATE, "When syncing, download all metadata and content now."),
@@ -276,17 +297,20 @@ class Remote(MasterModel):
 
     ca_cert = models.TextField(null=True)
     client_cert = models.TextField(null=True)
-    client_key = models.TextField(null=True)
+    client_key = EncryptedTextField(null=True)
     tls_validation = models.BooleanField(default=True)
 
-    username = models.TextField(null=True)
-    password = models.TextField(null=True)
+    username = EncryptedTextField(null=True)
+    password = EncryptedTextField(null=True)
 
     proxy_url = models.TextField(null=True)
-    proxy_username = models.TextField(null=True)
-    proxy_password = models.TextField(null=True)
+    proxy_username = EncryptedTextField(null=True)
+    proxy_password = EncryptedTextField(null=True)
 
-    download_concurrency = models.PositiveIntegerField(default=10)
+    download_concurrency = models.PositiveIntegerField(
+        null=True, validators=[MinValueValidator(1, "Download concurrency must be at least 1")]
+    )
+    max_retries = models.PositiveIntegerField(null=True)
     policy = models.TextField(choices=POLICY_CHOICES, default=IMMEDIATE)
 
     total_timeout = models.FloatField(
@@ -301,7 +325,7 @@ class Remote(MasterModel):
     sock_read_timeout = models.FloatField(
         null=True, validators=[MinValueValidator(0.0, "Timeout must be >= 0")]
     )
-    headers = JSONField(blank=True, null=True)
+    headers = models.JSONField(blank=True, null=True)
     rate_limit = models.IntegerField(null=True)
 
     @property
@@ -420,6 +444,14 @@ class Remote(MasterModel):
         """
         raise NotImplementedError()
 
+    @hook(BEFORE_DELETE)
+    def invalidate_cache(self):
+        """Invalidates the cache if remote is present."""
+        if settings.CACHE_ENABLED:
+            base_paths = self.distribution_set.values_list("base_path", flat=True)
+            if base_paths:
+                Cache().delete(base_key=base_paths)
+
     class Meta:
         default_related_name = "remotes"
 
@@ -511,13 +543,13 @@ class RepositoryVersion(BaseModel):
         number (models.PositiveIntegerField): A positive integer that uniquely identifies a version
             of a specific repository. Each new version for a repo should have this field set to
             1 + the most recent version.
-        action  (models.TextField): The action that produced the version.
         complete (models.BooleanField): If true, the RepositoryVersion is visible. This field is set
             to true when the task that creates the RepositoryVersion is complete.
 
     Relations:
 
         repository (models.ForeignKey): The associated repository.
+        base_version (models.ForeignKey): The repository version this was created from.
     """
 
     objects = RepositoryVersionQuerySet.as_manager()
@@ -532,36 +564,6 @@ class RepositoryVersion(BaseModel):
         unique_together = ("repository", "number")
         get_latest_by = "number"
         ordering = ("number",)
-
-    @classmethod
-    def versions_containing_content(cls, content):
-        """
-        Returns a query of repository versions containing the provided content units.
-
-        Args:
-            content (django.db.models.QuerySet): query of content
-
-        Returns:
-            django.db.models.QuerySet: Repository versions which contains content.
-        """
-        deprecation_logger(
-            "This method is deprecated and will be removed in version 3.14. "
-            "Use RepositoryVersion.objects.with_content() instead."
-        )
-        query = models.Q(pk__in=[])
-        repo_content = RepositoryContent.objects.filter(content__pk__in=content)
-
-        for rc in repo_content.iterator():
-            filter = models.Q(
-                repository__pk=rc.repository.pk,
-                number__gte=rc.version_added.number,
-            )
-            if rc.version_removed:
-                filter &= models.Q(number__lt=rc.version_removed.number)
-
-            query |= filter
-
-        return cls.objects.filter(query)
 
     def _content_relationships(self):
         """
@@ -887,6 +889,11 @@ class RepositoryVersion(BaseModel):
         Deletion of a complete RepositoryVersion should be done in a RQ Job.
         """
         if self.complete:
+            if settings.CACHE_ENABLED:
+                base_paths = self.distribution_set.values_list("base_path", flat=True)
+                if base_paths:
+                    Cache().delete(base_key=base_paths)
+
             repo_relations = RepositoryContent.objects.filter(repository=self.repository)
             try:
                 next_version = self.next()
@@ -975,6 +982,7 @@ class RepositoryVersion(BaseModel):
                     self.repository.next_version = self.number + 1
                     self.repository.save()
                     self.save()
+                    self.repository.cleanup_old_versions()
                     self._compute_counts()
                     repository.on_new_version(self)
             except Exception:

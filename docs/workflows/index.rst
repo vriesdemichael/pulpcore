@@ -10,6 +10,7 @@ assumes that the reader is familiar with the fundamentals discussed in the :doc:
 .. toctree::
    :maxdepth: 2
 
+   alternate-content-sources
    upload-publish
    repo-versioning
    on-demand-downloading
@@ -18,5 +19,7 @@ assumes that the reader is familiar with the fundamentals discussed in the :doc:
    exposing-content
    signed-metadata
    repairing-pulp
+   reclaim-disk-space
    import-export
    labels
+   troubleshooting

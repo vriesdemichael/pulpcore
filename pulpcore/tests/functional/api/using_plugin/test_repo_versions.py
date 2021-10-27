@@ -6,10 +6,10 @@ from urllib.parse import urlsplit
 
 from pulp_smash import api, config, utils
 from pulp_smash.exceptions import TaskReportError
-from pulp_smash.pulp3.bindings import monitor_task
+from pulp_smash.pulp3.bindings import delete_orphans, monitor_task
 from pulp_smash.pulp3.constants import ARTIFACTS_PATH
 from pulp_smash.pulp3.utils import (
-    delete_orphans,
+    download_content_unit,
     delete_version,
     gen_repo,
     gen_distribution,
@@ -133,6 +133,7 @@ class AddRemoveContentTestCase(unittest.TestCase):
         * The ``content_removed_summary`` attribute is correct.
         """
         body = gen_file_remote()
+        body.update({"headers": [{"Connection": "keep-alive"}]})
         self.remote.update(self.client.post(FILE_REMOTE_PATH, body))
         sync(self.cfg, self.remote, self.repo)
         repo = self.client.get(self.repo["pulp_href"])
@@ -597,7 +598,7 @@ class CreateRepoBaseVersionTestCase(unittest.TestCase):
     def setUpClass(cls):
         """Create class-wide variables."""
         cls.cfg = config.get_config()
-        delete_orphans(cls.cfg)
+        delete_orphans()
         populate_pulp(cls.cfg, url=FILE_LARGE_FIXTURE_MANIFEST_URL)
         cls.client = api.Client(cls.cfg, api.page_handler)
         cls.content = cls.client.get(FILE_CONTENT_PATH)
@@ -1046,11 +1047,11 @@ class BaseVersionTestCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         """Clean created resources."""
-        delete_orphans(cls.cfg)
+        delete_orphans()
 
     def test_add_content_with_base_version(self):
         """Test modify repository with base_version"""
-        delete_orphans(self.cfg)
+        delete_orphans()
 
         repo = self.client.post(FILE_REPO_PATH, gen_repo())
         self.addCleanup(self.client.delete, repo["pulp_href"])
@@ -1089,7 +1090,7 @@ class BaseVersionTestCase(unittest.TestCase):
 
 
 class RepoVersionRetentionTestCase(unittest.TestCase):
-    """Test retained_versions for repositories
+    """Test retain_repo_versions for repositories
 
     This test targets the following issues:
 
@@ -1133,32 +1134,44 @@ class RepoVersionRetentionTestCase(unittest.TestCase):
                 repository_version=self.repo.latest_version_href
             ).results
 
-    def test_retained_versions(self):
+    def test_retain_repo_versions(self):
         """Test repo version retention."""
-        self._create_repo_versions({"retained_versions": 1})
+        self._create_repo_versions({"retain_repo_versions": 1})
 
         versions = self.version_api.list(file_file_repository_href=self.repo.pulp_href).results
         self.assertEqual(len(versions), 1)
-        self.assertEqual(self.repo.latest_version_href.split("/")[-2], "3")
 
-    def test_retained_versions_on_update(self):
-        """Test repo version retention when retained_versions is set."""
+        latest_version = self.version_api.read(
+            file_file_repository_version_href=self.repo.latest_version_href
+        )
+        self.assertEqual(latest_version.number, 3)
+        self.assertEqual(latest_version.content_summary.present["file.file"]["count"], 3)
+        self.assertEqual(latest_version.content_summary.added["file.file"]["count"], 3)
+
+    def test_retain_repo_versions_on_update(self):
+        """Test repo version retention when retain_repo_versions is set."""
         self._create_repo_versions()
 
         versions = self.version_api.list(file_file_repository_href=self.repo.pulp_href).results
         self.assertEqual(len(versions), 4)
 
-        # update retained_versions to 2
-        result = self.repo_api.partial_update(self.repo.pulp_href, {"retained_versions": 2})
+        # update retain_repo_versions to 2
+        result = self.repo_api.partial_update(self.repo.pulp_href, {"retain_repo_versions": 2})
         monitor_task(result.task)
 
         versions = self.version_api.list(file_file_repository_href=self.repo.pulp_href).results
         self.assertEqual(len(versions), 2)
-        self.assertEqual(self.repo.latest_version_href.split("/")[-2], "3")
+
+        latest_version = self.version_api.read(
+            file_file_repository_version_href=self.repo.latest_version_href
+        )
+        self.assertEqual(latest_version.number, 3)
+        self.assertEqual(latest_version.content_summary.present["file.file"]["count"], 3)
+        self.assertEqual(latest_version.content_summary.added["file.file"]["count"], 1)
 
     def test_autodistribute(self):
         """Test repo version retention with autopublish/autodistribute."""
-        self._create_repo_versions({"retained_versions": 1, "autopublish": True})
+        self._create_repo_versions({"retain_repo_versions": 1, "autopublish": True})
 
         # all but the last publication should be gone
         for publication in self.publications[:-1]:
@@ -1167,8 +1180,8 @@ class RepoVersionRetentionTestCase(unittest.TestCase):
             self.assertEqual(404, ae.exception.status)
 
         # check that the last publication is distributed
-        self.distro = self.distro_api.read(self.distro.pulp_href)
-        self.assertEqual(self.distro.publication, self.publications[-1].pulp_href)
+        manifest = download_content_unit(self.cfg, self.distro.to_dict(), "PULP_MANIFEST")
+        self.assertEqual(manifest.decode("utf-8").count("\n"), len(self.content))
 
 
 class ContentInRepositoryVersionViewTestCase(unittest.TestCase):
@@ -1183,7 +1196,7 @@ class ContentInRepositoryVersionViewTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        delete_orphans(cls.cfg)
+        delete_orphans()
 
     def test_all(self):
         """Sync two repositories and check view filter."""
@@ -1197,8 +1210,7 @@ class ContentInRepositoryVersionViewTestCase(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status, 400)
 
-        # No repository version exists.
-        self.assertEqual(self.repo_ver_api.list().count, 0)
+        initial_rv_count = self.repo_ver_api.list(limit=1).count
 
         repo = self.repo_api.create(gen_repo())
         self.addCleanup(self.repo_api.delete, repo.pulp_href)
@@ -1234,4 +1246,4 @@ class ContentInRepositoryVersionViewTestCase(unittest.TestCase):
         # Test if repositories version with content matches.
         self.assertEqual(rv_search[0]["pulp_href"], repo.latest_version_href)
         # Test total number of repository version. Two for each repository.
-        self.assertEqual(rv_total, 4)
+        self.assertEqual(rv_total - initial_rv_count, 4)

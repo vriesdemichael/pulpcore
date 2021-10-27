@@ -3,6 +3,7 @@ Content related Django models.
 """
 from gettext import gettext as _
 
+import datetime
 import json
 import tempfile
 import shutil
@@ -17,6 +18,7 @@ from django.core import validators
 from django.core.files.storage import default_storage
 from django.db import IntegrityError, models, transaction
 from django.forms.models import model_to_dict
+from django.utils.timezone import now
 from django_lifecycle import BEFORE_UPDATE, BEFORE_SAVE, hook
 
 from pulpcore.constants import ALL_KNOWN_CONTENT_CHECKSUMS
@@ -90,6 +92,18 @@ class BulkCreateManager(models.Manager):
         return objs
 
 
+class BulkTouchQuerySet(models.QuerySet):
+    """
+    A query set that provides ``touch()``.
+    """
+
+    def touch(self):
+        """
+        Update the ``timestamp_of_interest`` on all objects of the query.
+        """
+        return self.update(timestamp_of_interest=now())
+
+
 class QueryMixin:
     """
     A mixin that provides models with querying utilities.
@@ -139,6 +153,13 @@ class HandleTempFilesMixin:
         self.file.delete(save=False)
 
 
+class ArtifactManager(BulkCreateManager):
+    def orphaned(self, orphan_protection_time):
+        """Returns set of orphaned artifacts that are ready to be cleaned up."""
+        expiration = now() - datetime.timedelta(minutes=orphan_protection_time)
+        return self.filter(content_memberships__isnull=True, timestamp_of_interest__lt=expiration)
+
+
 class Artifact(HandleTempFilesMixin, BaseModel):
     """
     A file associated with a piece of content.
@@ -160,6 +181,7 @@ class Artifact(HandleTempFilesMixin, BaseModel):
         sha256 (models.CharField): The SHA-256 checksum of the file (REQUIRED).
         sha384 (models.CharField): The SHA-384 checksum of the file.
         sha512 (models.CharField): The SHA-512 checksum of the file.
+        timestamp_of_interest (models.DateTimeField): timestamp that prevents orphan cleanup
     """
 
     def storage_path(self, name):
@@ -180,8 +202,9 @@ class Artifact(HandleTempFilesMixin, BaseModel):
     sha256 = models.CharField(max_length=64, null=False, unique=True, db_index=True)
     sha384 = models.CharField(max_length=96, null=True, unique=True, db_index=True)
     sha512 = models.CharField(max_length=128, null=True, unique=True, db_index=True)
+    timestamp_of_interest = models.DateTimeField(auto_now=True)
 
-    objects = BulkCreateManager()
+    objects = ArtifactManager.from_queryset(BulkTouchQuerySet)()
 
     # All available digest fields ordered by algorithm strength.
     DIGEST_FIELDS = _DIGEST_FIELDS
@@ -331,6 +354,10 @@ class Artifact(HandleTempFilesMixin, BaseModel):
         temp_file.delete()
         return artifact
 
+    def touch(self):
+        """Update timestamp_of_interest."""
+        self.save(update_fields=["timestamp_of_interest"])
+
 
 class PulpTemporaryFile(HandleTempFilesMixin, BaseModel):
     """
@@ -420,25 +447,45 @@ class PulpTemporaryFile(HandleTempFilesMixin, BaseModel):
         return PulpTemporaryFile(file=file)
 
 
+class ContentManager(BulkCreateManager):
+    def orphaned(self, orphan_protection_time, content_pks=None):
+        """Returns set of orphaned content that is ready to be cleaned up."""
+        expiration = now() - datetime.timedelta(minutes=orphan_protection_time)
+        if content_pks:
+            return self.filter(
+                version_memberships__isnull=True,
+                timestamp_of_interest__lt=expiration,
+                pk__in=content_pks,
+            )
+        return self.filter(version_memberships__isnull=True, timestamp_of_interest__lt=expiration)
+
+
+ContentManager = ContentManager.from_queryset(BulkTouchQuerySet)
+
+
 class Content(MasterModel, QueryMixin):
     """
     A piece of managed content.
 
     Fields:
         upstream_id (models.UUIDField) : identifier of content imported from an 'upstream' Pulp
+        timestamp_of_interest (models.DateTimeField): timestamp that prevents orphan cleanup
 
     Relations:
 
         _artifacts (models.ManyToManyField): Artifacts related to Content through ContentArtifact
     """
 
+    PROTECTED_FROM_RECLAIM = True
+
     TYPE = "content"
     repo_key_fields = ()  # Used by pulpcore.plugin.repo_version_utils.remove_duplicates
     upstream_id = models.UUIDField(null=True)  # Used by PulpImport/Export processing
 
     _artifacts = models.ManyToManyField(Artifact, through="ContentArtifact")
+    timestamp_of_interest = models.DateTimeField(auto_now=True)
 
-    objects = BulkCreateManager()
+    objects = ContentManager()
 
     class Meta:
         verbose_name_plural = "content"
@@ -494,6 +541,10 @@ class Content(MasterModel, QueryMixin):
             An un-saved instance of :class:`~pulpcore.plugin.models.Content` sub-class.
         """
         raise NotImplementedError()
+
+    def touch(self):
+        """Update timestamp_of_interest."""
+        self.save(update_fields=["timestamp_of_interest"])
 
 
 class ContentArtifact(BaseModel, QueryMixin):

@@ -138,7 +138,7 @@ class NamedModelViewSet(viewsets.GenericViewSet):
         return self.serializer_class
 
     @staticmethod
-    def get_resource(uri, model):
+    def get_resource(uri, model=None):
         """
         Resolve a resource URI to an instance of the resource.
 
@@ -147,7 +147,8 @@ class NamedModelViewSet(viewsets.GenericViewSet):
 
         Args:
             uri (str): A resource URI.
-            model (django.models.Model): A model class.
+            model (django.models.Model): A model class. If not provided, the method automatically
+                determines the used model from the resource URI.
 
         Returns:
             django.models.Model: The resource fetched from the DB.
@@ -168,6 +169,10 @@ class NamedModelViewSet(viewsets.GenericViewSet):
                     kwargs["{}__pk".format(key[:-3])] = value
                 else:
                     kwargs[key] = value
+
+        if model is None:
+            model = match.func.cls.queryset.model
+
         try:
             return model.objects.get(**kwargs)
         except model.MultipleObjectsReturned:
@@ -426,7 +431,7 @@ class AsyncCreateMixin:
         app_label = self.queryset.model._meta.app_label
         task = dispatch(
             tasks.base.general_create,
-            self.async_reserved_resources(None),
+            exclusive_resources=self.async_reserved_resources(None),
             args=(app_label, serializer.__class__.__name__),
             kwargs={"data": request.data},
         )
@@ -450,7 +455,7 @@ class AsyncUpdateMixin(AsyncReservedObjectMixin):
         app_label = instance._meta.app_label
         task = dispatch(
             tasks.base.general_update,
-            self.async_reserved_resources(instance),
+            exclusive_resources=self.async_reserved_resources(instance),
             args=(pk, app_label, serializer.__class__.__name__),
             kwargs={"data": request.data, "partial": partial},
         )
@@ -483,7 +488,7 @@ class AsyncRemoveMixin(AsyncReservedObjectMixin):
         app_label = instance._meta.app_label
         task = dispatch(
             tasks.base.general_delete,
-            self.async_reserved_resources(instance),
+            exclusive_resources=self.async_reserved_resources(instance),
             args=(pk, app_label, serializer.__class__.__name__),
         )
         return OperationPostponedResponse(task, request)

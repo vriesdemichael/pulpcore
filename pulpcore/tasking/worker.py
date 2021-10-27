@@ -16,11 +16,13 @@ from guardian.shortcuts import get_users_with_perms  # noqa: E402: module level 
 from django_currentuser.middleware import (  # noqa: E402: module level not at top of file
     _set_current_user,
 )
-from django_guid.middleware import GuidMiddleware  # noqa: E402: module level not at top of file
+from django_guid import set_guid  # noqa: E402: module level not at top of file
 
+from pulpcore.app import settings  # noqa: E402: module level not at top of file
 from pulpcore.app.settings import WORKER_TTL  # noqa: E402: module level not at top of file
 
 from pulpcore.app.models import Task  # noqa: E402: module level not at top of file
+from pulpcore.constants import TASK_STATES  # noqa: E402: module level not at top of file
 
 from pulpcore.tasking.constants import (  # noqa: E402: module level not at top of file
     TASKING_CONSTANTS,
@@ -60,6 +62,9 @@ class PulpWorker(Worker):
     log_result_lifespan = False
 
     def __init__(self, queues, **kwargs):
+
+        if settings.USE_NEW_WORKER_TYPE:
+            raise NotImplementedError("This worker is not supposed to run with new style tasks.")
 
         if kwargs.get("name"):
             kwargs["name"] = kwargs["name"].replace("%h", socket.getfqdn())
@@ -101,10 +106,12 @@ class PulpWorker(Worker):
         except Task.DoesNotExist:
             pass
         else:
+            if task.state != TASK_STATES.WAITING:
+                return
             task.set_running()
             user = get_users_with_perms(task).first()
             _set_current_user(user)
-            GuidMiddleware.set_guid(task.logging_cid)
+            set_guid(task.logging_cid)
 
         with TaskWorkingDirectory(job):
             return super().perform_job(job, queue)

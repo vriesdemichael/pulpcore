@@ -3,8 +3,9 @@ import unittest
 from urllib.parse import urljoin
 
 from pulp_smash import api, config, utils
+from pulp_smash.pulp3.bindings import delete_orphans
 from pulp_smash.pulp3.constants import TASKS_PATH
-from pulp_smash.pulp3.utils import delete_orphans, gen_remote, gen_repo, get_content_summary, sync
+from pulp_smash.pulp3.utils import gen_remote, gen_repo, get_content_summary, sync
 from requests.exceptions import HTTPError
 
 from pulpcore.tests.functional.api.using_plugin.constants import (
@@ -82,7 +83,7 @@ class CancelTaskTestCase(unittest.TestCase):
         task = self.create_long_task()
         response = self.cancel_task(task)
         self.assertIsNone(response["finished_at"], response)
-        self.assertEqual(response["state"], "canceled", response)
+        self.assertIn(response["state"], ["canceling", "canceled"], response)
 
     def test_cancel_nonexistent_task(self):
         """Cancel a nonexistent task."""
@@ -112,7 +113,7 @@ class CancelTaskTestCase(unittest.TestCase):
     def create_long_task(self):
         """Create a long task. Sync a repository with large files."""
         # to force the download of files.
-        delete_orphans(self.cfg)
+        delete_orphans()
 
         repo = self.client.post(FILE_REPO_PATH, gen_repo())
         self.addCleanup(self.client.delete, repo["pulp_href"])

@@ -1,10 +1,15 @@
 from collections import defaultdict
+import inspect
 
+from asgiref.sync import sync_to_async
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 
-from pulpcore.plugin.models import ContentArtifact
+from pulpcore.app.loggers import deprecation_logger
+from pulpcore.plugin.sync import sync_to_async_iterable
+
+from pulpcore.plugin.models import Content, ContentArtifact, ProgressReport
 
 from .api import Stage
 
@@ -47,8 +52,24 @@ class QueryExistingContents(Stage):
                     content_q_by_type[model_type] = content_q_by_type[model_type] | unit_q
                     d_content_by_nat_key[d_content.content.natural_key()].append(d_content)
 
-            for model_type in content_q_by_type.keys():
-                for result in model_type.objects.filter(content_q_by_type[model_type]).iterator():
+            for model_type, content_q in content_q_by_type.items():
+                try:
+                    await sync_to_async(model_type.objects.filter(content_q).touch)()
+                except AttributeError:
+                    from pulpcore.app.loggers import deprecation_logger
+                    from gettext import gettext as _
+
+                    deprecation_logger.warning(
+                        _(
+                            "As of pulpcore 3.14.5, plugins which declare custom ORM managers on "
+                            "their content classes should have those managers inherit from "
+                            "pulpcore.plugin.models.ContentManager. This will become a hard error "
+                            "in the future."
+                        )
+                    )
+                async for result in sync_to_async_iterable(
+                    model_type.objects.filter(content_q).iterator()
+                ):
                     for d_content in d_content_by_nat_key[result.natural_key()]:
                         d_content.content = result
 
@@ -83,43 +104,85 @@ class ContentSaver(Stage):
             The coroutine for this stage.
         """
         async for batch in self.batches():
-            content_artifact_bulk = []
-            with transaction.atomic():
-                await self._pre_save(batch)
 
-                for d_content in batch:
-                    # Are we saving to the database for the first time?
-                    content_already_saved = not d_content.content._state.adding
-                    if not content_already_saved:
-                        try:
-                            with transaction.atomic():
-                                d_content.content.save()
-                        except IntegrityError as e:
+            def process_batch():
+                content_artifact_bulk = []
+                to_update_ca_query = ContentArtifact.objects.none()
+                to_update_ca_bulk = []
+                to_update_ca_artifact = {}
+                with transaction.atomic():
+                    if not inspect.iscoroutinefunction(self._pre_save):
+                        self._pre_save(batch)
+                    for d_content in batch:
+                        # Are we saving to the database for the first time?
+                        content_already_saved = not d_content.content._state.adding
+                        if not content_already_saved:
                             try:
-                                d_content.content = d_content.content.__class__.objects.get(
-                                    d_content.content.q()
-                                )
-                            except ObjectDoesNotExist:
-                                raise e
-                            continue
+                                with transaction.atomic():
+                                    d_content.content.save()
+                            except IntegrityError as e:
+                                try:
+                                    d_content.content = d_content.content.__class__.objects.get(
+                                        d_content.content.q()
+                                    )
+                                except ObjectDoesNotExist:
+                                    raise e
+                            else:
+                                for d_artifact in d_content.d_artifacts:
+                                    if not d_artifact.artifact._state.adding:
+                                        artifact = d_artifact.artifact
+                                    else:
+                                        # set to None for on-demand synced artifacts
+                                        artifact = None
+                                    content_artifact = ContentArtifact(
+                                        content=d_content.content,
+                                        artifact=artifact,
+                                        relative_path=d_artifact.relative_path,
+                                    )
+                                    content_artifact_bulk.append(content_artifact)
+                                continue
+                        # When the Content already exists, check if ContentArtifacts need to be
+                        # updated
                         for d_artifact in d_content.d_artifacts:
                             if not d_artifact.artifact._state.adding:
-                                artifact = d_artifact.artifact
-                            else:
-                                # set to None for on-demand synced artifacts
-                                artifact = None
-                            content_artifact = ContentArtifact(
-                                content=d_content.content,
-                                artifact=artifact,
-                                relative_path=d_artifact.relative_path,
-                            )
-                            content_artifact_bulk.append(content_artifact)
-                ContentArtifact.objects.bulk_get_or_create(content_artifact_bulk)
+                                # the artifact is already present in the database; update references
+                                # Creating one large query and one large dictionary
+                                to_update_ca_query |= ContentArtifact.objects.filter(
+                                    content=d_content.content,
+                                    relative_path=d_artifact.relative_path,
+                                )
+                                key = (d_content.content.pk, d_artifact.relative_path)
+                                to_update_ca_artifact[key] = d_artifact.artifact
+                    # Query db once and update each object in memory for bulk_update call
+                    for content_artifact in to_update_ca_query.iterator():
+                        key = (content_artifact.content_id, content_artifact.relative_path)
+                        # Maybe remove dict elements after to reduce memory?
+                        content_artifact.artifact = to_update_ca_artifact[key]
+                        to_update_ca_bulk.append(content_artifact)
+                    ContentArtifact.objects.bulk_update(to_update_ca_bulk, ["artifact"])
+                    ContentArtifact.objects.bulk_get_or_create(content_artifact_bulk)
+                    if not inspect.iscoroutinefunction(self._post_save):
+                        self._post_save(batch)
+
+            if inspect.iscoroutinefunction(self._pre_save):
+                deprecation_logger.warning(
+                    "ContentSaver._pre_save() coroutine has been deprecated. Support will be "
+                    "dropped in pulpcore 3.16. ContentSaver._pre_save() should now be a "
+                    "synchronous function."
+                )
+                await self._pre_save(batch)
+            await sync_to_async(process_batch)()
+            if inspect.iscoroutinefunction(self._post_save):
+                deprecation_logger.warning(
+                    "ContentSaver._post_save() coroutine has been deprecated. Support will be "
+                    "dropped in pulpcore 3.16. ContentSaver._post_save() should now be a "
+                    "synchronous function."
+                )
                 await self._post_save(batch)
             for declarative_content in batch:
                 await self.put(declarative_content)
 
-    async def _pre_save(self, batch):
+    def _pre_save(self, batch):
         """
         A hook plugin-writers can override to save related objects prior to content unit saving.
 
@@ -132,7 +195,7 @@ class ContentSaver(Stage):
         """
         pass
 
-    async def _post_save(self, batch):
+    def _post_save(self, batch):
         """
         A hook plugin-writers can override to save related objects after content unit saving.
 
@@ -187,3 +250,73 @@ class ResolveContentFutures(Stage):
         async for d_content in self.items():
             d_content.resolve()
             await self.put(d_content)
+
+
+class ContentAssociation(Stage):
+    """
+    A Stages API stage that associates content units with `new_version`.
+
+    This stage stores all content unit primary keys in memory before running. This is done to
+    compute the units already associated but not received from `self._in_q`. These units are passed
+    via `self._out_q` to the next stage as a :class:`django.db.models.query.QuerySet`.
+
+    This stage creates a ProgressReport named 'Associating Content' that counts the number of units
+    associated. Since it's a stream the total count isn't known until it's finished.
+
+    If `mirror` was enabled, then content units may also be un-assocated (removed) from
+    `new_version`. A ProgressReport named 'Un-Associating Content' is created that counts the number
+    of units un-associated.
+
+    Args:
+        new_version (:class:`~pulpcore.plugin.models.RepositoryVersion`): The repo version this
+            stage associates content with.
+        mirror (bool): Whether or not to "mirror" the stream of DeclarativeContent - whether content
+            not in the stream should be removed from the repository.
+        args: unused positional arguments passed along to :class:`~pulpcore.plugin.stages.Stage`.
+        kwargs: unused keyword arguments passed along to :class:`~pulpcore.plugin.stages.Stage`.
+    """
+
+    def __init__(self, new_version, mirror, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.new_version = new_version
+        self.allow_delete = mirror
+
+    async def run(self):
+        """
+        The coroutine for this stage.
+
+        Returns:
+            The coroutine for this stage.
+        """
+        async with ProgressReport(message="Associating Content", code="associating.content") as pb:
+            to_delete = {
+                i
+                async for i in sync_to_async_iterable(
+                    self.new_version.content.values_list("pk", flat=True)
+                )
+            }
+
+            async for batch in self.batches():
+                to_add = set()
+                for d_content in batch:
+                    try:
+                        to_delete.remove(d_content.content.pk)
+                    except KeyError:
+                        to_add.add(d_content.content.pk)
+                        await self.put(d_content)
+
+                if to_add:
+                    await sync_to_async(self.new_version.add_content)(
+                        Content.objects.filter(pk__in=to_add)
+                    )
+                    await pb.aincrease_by(len(to_add))
+
+            if self.allow_delete:
+                async with ProgressReport(
+                    message="Un-Associating Content", code="unassociating.content"
+                ) as pb:
+                    if to_delete:
+                        await sync_to_async(self.new_version.remove_content)(
+                            Content.objects.filter(pk__in=to_delete)
+                        )
+                        await pb.aincrease_by(len(to_delete))

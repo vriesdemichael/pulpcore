@@ -31,7 +31,7 @@ class RepositorySerializer(ModelSerializer):
     description = serializers.CharField(
         help_text=_("An optional description."), required=False, allow_null=True
     )
-    retained_versions = serializers.IntegerField(
+    retain_repo_versions = serializers.IntegerField(
         help_text=_(
             "Retain X versions of the repository. Default is null which retains all versions."
             " This is provided as a tech preview in Pulp 3 and may change in the future."
@@ -41,6 +41,7 @@ class RepositorySerializer(ModelSerializer):
         min_value=1,
     )
     remote = DetailRelatedField(
+        help_text=_("An optional remote to use by default when syncing."),
         view_name_pattern=r"remotes(-.*/.*)-detail",
         queryset=models.Remote.objects.all(),
         required=False,
@@ -63,7 +64,7 @@ class RepositorySerializer(ModelSerializer):
             "latest_version_href",
             "name",
             "description",
-            "retained_versions",
+            "retain_repo_versions",
             "remote",
         )
 
@@ -136,7 +137,21 @@ class RemoteSerializer(ModelSerializer):
         help_text="Timestamp of the most recent update of the remote.", read_only=True
     )
     download_concurrency = serializers.IntegerField(
-        help_text="Total number of simultaneous connections.", required=False, min_value=1
+        help_text=(
+            "Total number of simultaneous connections. If not set then the default "
+            "value will be used."
+        ),
+        allow_null=True,
+        required=False,
+        min_value=1,
+    )
+    max_retries = serializers.IntegerField(
+        help_text=(
+            "Maximum number of retry attempts after a download failure. If not set then the "
+            "default value (3) will be used."
+        ),
+        required=False,
+        allow_null=True,
     )
     policy = serializers.ChoiceField(
         help_text="The policy to use when downloading content.",
@@ -147,25 +162,37 @@ class RemoteSerializer(ModelSerializer):
     total_timeout = serializers.FloatField(
         allow_null=True,
         required=False,
-        help_text="aiohttp.ClientTimeout.total (q.v.) for download-connections.",
+        help_text=(
+            "aiohttp.ClientTimeout.total (q.v.) for download-connections. The default is null, "
+            "which will cause the default from the aiohttp library to be used."
+        ),
         min_value=0.0,
     )
     connect_timeout = serializers.FloatField(
         allow_null=True,
         required=False,
-        help_text="aiohttp.ClientTimeout.connect (q.v.) for download-connections.",
+        help_text=(
+            "aiohttp.ClientTimeout.connect (q.v.) for download-connections. The default is null, "
+            "which will cause the default from the aiohttp library to be used."
+        ),
         min_value=0.0,
     )
     sock_connect_timeout = serializers.FloatField(
         allow_null=True,
         required=False,
-        help_text="aiohttp.ClientTimeout.sock_connect (q.v.) for download-connections.",
+        help_text=(
+            "aiohttp.ClientTimeout.sock_connect (q.v.) for download-connections. The default is "
+            "null, which will cause the default from the aiohttp library to be used."
+        ),
         min_value=0.0,
     )
     sock_read_timeout = serializers.FloatField(
         allow_null=True,
         required=False,
-        help_text="aiohttp.ClientTimeout.sock_read (q.v.) for download-connections.",
+        help_text=(
+            "aiohttp.ClientTimeout.sock_read (q.v.) for download-connections. The default is "
+            "null, which will cause the default from the aiohttp library to be used."
+        ),
         min_value=0.0,
     )
     headers = serializers.ListField(
@@ -179,14 +206,14 @@ class RemoteSerializer(ModelSerializer):
         required=False,
     )
 
-    def validate_url(self, value):
+    def validate_url(self, url):
         """
         Check if the 'url' is a ``file://`` path, and if so, ensure it's an ALLOWED_IMPORT_PATH.
 
         The ALLOWED_IMPORT_PATH is specified as a Pulp setting.
 
         Args:
-            value: The user-provided value for 'url' to be validated.
+            url: The user-provided value for 'url' to be validated.
 
         Raises:
             ValidationError: When the url starts with `file://`, but is not a subfolder of a path in
@@ -195,16 +222,24 @@ class RemoteSerializer(ModelSerializer):
         Returns:
             The validated value.
         """
-        if not value.lower().startswith("file://"):
-            return value
+        if not url.lower().startswith("file://"):
+            return url
 
-        user_path = value[7:]
+        user_path = url[7:]
+        if not os.path.isabs(user_path):
+            raise serializers.ValidationError(
+                _("The path '{}' needs to be an absolute pathname.").format(user_path)
+            )
+
+        user_provided_realpath = os.path.realpath(user_path)
 
         for allowed_path in settings.ALLOWED_IMPORT_PATHS:
-            user_provided_realpath = os.path.realpath(user_path)
             if user_provided_realpath.startswith(allowed_path):
-                return value
-        raise serializers.ValidationError(_("url '{}' is not an allowed import path").format(value))
+                return url
+
+        raise serializers.ValidationError(
+            _("The path '{}' does not start with any of the allowed import paths").format(user_path)
+        )
 
     def validate_proxy_url(self, value):
         """
@@ -257,6 +292,7 @@ class RemoteSerializer(ModelSerializer):
             "pulp_labels",
             "pulp_last_updated",
             "download_concurrency",
+            "max_retries",
             "policy",
             "total_timeout",
             "connect_timeout",

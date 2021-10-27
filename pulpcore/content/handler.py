@@ -3,22 +3,23 @@ import logging
 import mimetypes
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import shlex
 import subprocess
 import tempfile
 from gettext import gettext as _
-from typing import Optional
 
 from aiohttp.client_exceptions import ClientResponseError
 from aiohttp.web import FileResponse, StreamResponse, HTTPOk
 from aiohttp.web_exceptions import HTTPForbidden, HTTPFound, HTTPNotFound
+from pulpcore.exceptions.http import VirusFoundError
+
+from pulpcore.download import BaseDownloader, DownloadResult
+from yarl import URL
 
 import django
 from django.utils import timezone
 
-from pulpcore.app.models.content import ScanResult, Content
-from pulpcore.download import BaseDownloader, DownloadResult
-from pulpcore.exceptions.http import VirusFoundError
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pulpcore.app.settings")
 django.setup()
@@ -30,22 +31,32 @@ from django.core.exceptions import (  # noqa: E402: module level not at top of f
 )
 from django.db import (  # noqa: E402: module level not at top of file
     connection,
+    DatabaseError,
     IntegrityError,
     transaction,
 )
 from pulpcore.app.models import (  # noqa: E402: module level not at top of file
     Artifact,
-    BaseDistribution,
     ContentArtifact,
     Distribution,
+    Publication,
     Remote,
-    RemoteArtifact,
+    RemoteArtifact, ScanResult,
 )
 from pulpcore.exceptions import UnsupportedDigestValidationError  # noqa: E402
 
 from jinja2 import Template  # noqa: E402: module level not at top of file
+from pulpcore.cache import ContentCache  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+
+loop = asyncio.get_event_loop()
+# Django ORM is blocking, as are most of our file operations. This means that the
+# standard single-threaded async executor cannot help us. We need to create a separate,
+# thread-based executor to pass our heavy blocking IO work to.
+io_pool_exc = ThreadPoolExecutor(max_workers=2)
+loop.set_default_executor(io_pool_exc)
 
 
 class PathNotResolved(HTTPNotFound):
@@ -126,14 +137,72 @@ class Handler:
         """
         self._reset_db_connection()
 
-        if self.distribution_model is None:
-            base_paths = list(BaseDistribution.objects.values_list("base_path", flat=True))
-            base_paths.extend(list(Distribution.objects.values_list("base_path", flat=True)))
-        else:
-            base_paths = list(self.distribution_model.objects.values_list("base_path", flat=True))
-        directory_list = ["{}/".format(base_path) for base_path in base_paths]
+        def get_base_paths_blocking():
+            if self.distribution_model is None:
+                base_paths = list(Distribution.objects.values_list("base_path", flat=True))
+            else:
+                base_paths = list(
+                    self.distribution_model.objects.values_list("base_path", flat=True)
+                )
+            return base_paths
+
+        base_paths = await loop.run_in_executor(None, get_base_paths_blocking)
+        directory_list = ["{}/".format(path) for path in base_paths]
         return HTTPOk(headers={"Content-Type": "text/html"}, body=self.render_html(directory_list))
 
+    @classmethod
+    async def find_base_path_cached(cls, request, cached):
+        """
+        Finds the base-path to use for the base-key in the cache
+
+        Args:
+            request (:class:`aiohttp.web.request`): The request from the client.
+            cached (:class:`CacheAiohttp`): The Pulp cache
+
+        Returns:
+            str: The base-path associated with this request
+        """
+        path = request.match_info["path"]
+        base_paths = cls._base_paths(path)
+        multiplied_base_paths = []
+        for i, base_path in enumerate(base_paths):
+            copied_by_index_base_path = [base_path for _ in range(i + 1)]
+            multiplied_base_paths.extend(copied_by_index_base_path)
+        index_p1 = await cached.exists(base_key=multiplied_base_paths)
+        if index_p1:
+            return base_paths[index_p1 - 1]
+        else:
+            distro = await loop.run_in_executor(None, cls._match_distribution, path)
+            return distro.base_path
+
+    @classmethod
+    async def auth_cached(cls, request, cached, base_key):
+        """
+        Authentication check for the cached stream_content handler
+
+        Args:
+            request (:class:`aiohttp.web.request`): The request from the client.
+            cached (:class:`CacheAiohttp`): The Pulp cache
+            base_key (str): The base_key associated with this response
+        """
+        guard_key = "DISTRO#GUARD#PRESENT"
+        present = await cached.get(guard_key, base_key=base_key)
+        if present == b"True" or present is None:
+            path = request.match_info["path"]
+            distro = await loop.run_in_executor(None, cls._match_distribution, path)
+            try:
+                guard = await loop.run_in_executor(None, cls._permit, request, distro)
+            except HTTPForbidden:
+                guard = True
+                raise
+            finally:
+                if not present:
+                    await cached.set(guard_key, str(guard), base_key=base_key)
+
+    @ContentCache(
+        base_key=lambda req, cac: Handler.find_base_path_cached(req, cac),
+        auth=lambda req, cac, bk: Handler.auth_cached(req, cac, bk),
+    )
     async def stream_content(self, request):
         """
         The request handler for the Content app.
@@ -185,25 +254,33 @@ class Handler:
         Raises:
             PathNotResolved: when not matched.
         """
+        cls._reset_db_connection()
+
         base_paths = cls._base_paths(path)
         if cls.distribution_model is None:
-            for model_class in [BaseDistribution, Distribution]:
-                try:
-                    return model_class.objects.get(base_path__in=base_paths).cast()
-                except ObjectDoesNotExist:
-                    log.debug(
-                        _("{model_name} not matched for {path} using: {base_paths}").format(
-                            model_name=model_class.__name__, path=path, base_paths=base_paths
-                        )
-                    )
-        else:
             try:
-                model_class = cls.distribution_model
-                return cls.distribution_model.objects.get(base_path__in=base_paths)
+                return (
+                    Distribution.objects.select_related(
+                        "repository", "repository_version", "publication", "remote"
+                    )
+                    .get(base_path__in=base_paths)
+                    .cast()
+                )
             except ObjectDoesNotExist:
                 log.debug(
-                    _("{model_name} not matched for {path} using: {base_paths}").format(
-                        model_name=model_class.__name__, path=path, base_paths=base_paths
+                    _("Distribution not matched for {path} using: {base_paths}").format(
+                        path=path, base_paths=base_paths
+                    )
+                )
+        else:
+            try:
+                return cls.distribution_model.objects.select_related(
+                    "repository", "repository_version", "publication", "remote"
+                ).get(base_path__in=base_paths)
+            except ObjectDoesNotExist:
+                log.debug(
+                    _("Distribution not matched for {path} using: {base_paths}").format(
+                        path=path, base_paths=base_paths
                     )
                 )
         raise PathNotResolved(path)
@@ -217,7 +294,7 @@ class Handler:
 
         Args:
             request (:class:`aiohttp.web.Request`): A request for a published file.
-            distribution (detail of :class:`pulpcore.plugin.models.BaseDistribution`): The matched
+            distribution (detail of :class:`pulpcore.plugin.models.Distribution`): The matched
                 distribution.
 
         Raises:
@@ -225,7 +302,7 @@ class Handler:
         """
         guard = distribution.content_guard
         if not guard:
-            return
+            return False
         try:
             guard.cast().permit(request)
         except PermissionError as pe:
@@ -234,6 +311,7 @@ class Handler:
                 {"p": request.path, "g": guard.name, "r": str(pe)},
             )
             raise HTTPForbidden(reason=str(pe))
+        return True
 
     @staticmethod
     def response_headers(path):
@@ -295,44 +373,48 @@ class Handler:
         Returns:
             Set of strings representing the files and directories in the directory listing.
         """
-        if not publication and not repo_version:
-            raise Exception("Either a repo_version or publication is required.")
-        if publication and repo_version:
-            raise Exception("Either a repo_version or publication can be specified.")
 
         def file_or_directory_name(directory_path, relative_path):
             result = re.match(r"({})([^\/]*)(\/*)".format(directory_path), relative_path)
             return "{}{}".format(result.groups()[1], result.groups()[2])
 
-        directory_list = set()
+        def list_directory_blocking():
+            if not publication and not repo_version:
+                raise Exception("Either a repo_version or publication is required.")
+            if publication and repo_version:
+                raise Exception("Either a repo_version or publication can be specified.")
 
-        if publication:
-            pas = publication.published_artifact.filter(relative_path__startswith=path)
-            for pa in pas:
-                directory_list.add(file_or_directory_name(path, pa.relative_path))
+            directory_list = set()
 
-            if publication.pass_through:
+            if publication:
+                pas = publication.published_artifact.filter(relative_path__startswith=path)
+                for pa in pas:
+                    directory_list.add(file_or_directory_name(path, pa.relative_path))
+
+                if publication.pass_through:
+                    cas = ContentArtifact.objects.filter(
+                        content__in=publication.repository_version.content,
+                        relative_path__startswith=path,
+                    )
+                    for ca in cas:
+                        directory_list.add(file_or_directory_name(path, ca.relative_path))
+
+            if repo_version:
                 cas = ContentArtifact.objects.filter(
-                    content__in=publication.repository_version.content,
-                    relative_path__startswith=path,
+                    content__in=repo_version.content, relative_path__startswith=path
                 )
                 for ca in cas:
                     directory_list.add(file_or_directory_name(path, ca.relative_path))
 
-        if repo_version:
-            cas = ContentArtifact.objects.filter(
-                content__in=repo_version.content, relative_path__startswith=path
-            )
-            for ca in cas:
-                directory_list.add(file_or_directory_name(path, ca.relative_path))
+            if directory_list:
+                return directory_list
+            else:
+                raise PathNotResolved(path)
 
-        if directory_list:
-            return directory_list
-        else:
-            raise PathNotResolved(path)
+        return await loop.run_in_executor(None, list_directory_blocking)
 
     @staticmethod
-    def get_scan_result_for(content: Content, scan_command: str) -> Optional[ScanResult]:
+    def get_scan_result_for(content, scan_command: str):
         try:
             return ScanResult.objects.get(
                 content=content,
@@ -353,7 +435,7 @@ class Handler:
             The :class:`aiohttp.web.StreamResponse` for the file.
 
         """
-        
+
         response = StreamResponse(headers=headers)
         await response.prepare(request)
 
@@ -394,6 +476,7 @@ class Handler:
             :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
                 streamed back to the client.
         """
+        # TODO check latest changes
         security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
         av_enabled = security_scan_shell != ""
 
@@ -402,7 +485,7 @@ class Handler:
             policy = RemoteArtifact.objects.get(content_artifact=ca).remote.cast().policy
 
             # Determine if a scan is needed
-            sr: Optional[ScanResult] = self.get_scan_result_for(ca.content, security_scan_shell)
+            sr = self.get_scan_result_for(ca.content, security_scan_shell)
             if sr and ca.artifact and policy != Remote.STREAMED:
                 last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO make configurable
                 if last_midnight < sr.pulp_last_updated:
@@ -485,15 +568,15 @@ class Handler:
         Match the path and stream results either from the filesystem or by downloading new data.
 
         After deciding the client can access the distribution at ``path``, this function calls
-        :meth:`BaseDistribution.content_handler`. If that function returns a not-None result,
-        it is returned to the client.
+        :meth:`Distribution.content_handler`. If that function returns a not-None result, it is
+        returned to the client.
 
         Then the publication linked to the Distribution is used to determine what content should
         be served. If ``path`` is a directory entry (i.e. not a file), the directory contents
         are served to the client. This method calls
-        :meth:`BaseDistribution.content_handler_list_directory` to acquire any additional entries
-        the Distribution's content_handler might serve in that directory. If there is an Artifact
-        to be served, it is served to the client.
+        :meth:`Distribution.content_handler_list_directory` to acquire any additional entries the
+        Distribution's content_handler might serve in that directory. If there is an Artifact to be
+        served, it is served to the client.
 
         If there's no publication, the above paragraph is applied to the latest repository linked
         to the matched Distribution.
@@ -513,8 +596,16 @@ class Handler:
             :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
                 streamed back to the client.
         """
-        distro = self._match_distribution(path)
-        self._permit(request, distro)
+
+        def match_distribution_blocking():
+            return self._match_distribution(path)
+
+        distro = await loop.run_in_executor(None, match_distribution_blocking)
+
+        def check_permit_blocking():
+            self._permit(request, distro)
+
+        await loop.run_in_executor(None, check_permit_blocking)
 
         rel_path = path.lstrip("/")
         rel_path = rel_path[len(distro.base_path) :]
@@ -526,13 +617,45 @@ class Handler:
 
         headers = self.response_headers(rel_path)
 
-        publication = getattr(distro, "publication", None)
+        repository = distro.repository
+        publication = distro.publication
+        repo_version = distro.repository_version
+
+        if repository:
+
+            def get_latest_publication_or_version_blocking():
+                nonlocal repo_version
+                nonlocal publication
+
+                # Search for publication serving the closest latest version
+                if not publication:
+                    try:
+                        versions = repository.versions.all()
+                        publications = Publication.objects.filter(
+                            repository_version__in=versions, complete=True
+                        )
+                        publication = publications.select_related("repository_version").latest(
+                            "repository_version", "pulp_created"
+                        )
+                        repo_version = publication.repository_version
+                    except ObjectDoesNotExist:
+                        pass
+
+                if not repo_version:
+                    repo_version = repository.latest_version()
+
+            await loop.run_in_executor(None, get_latest_publication_or_version_blocking)
 
         if publication:
             if rel_path == "" or rel_path[-1] == "/":
                 try:
                     index_path = "{}index.html".format(rel_path)
-                    publication.published_artifact.get(relative_path=index_path)
+
+                    def get_published_artifact_blocking():
+                        publication.published_artifact.get(relative_path=index_path)
+
+                    await loop.run_in_executor(None, get_published_artifact_blocking)
+
                     rel_path = index_path
                     headers = self.response_headers(rel_path)
                 except ObjectDoesNotExist:
@@ -544,8 +667,18 @@ class Handler:
 
             # published artifact
             try:
-                pa = publication.published_artifact.get(relative_path=rel_path)
-                ca = pa.content_artifact
+
+                def get_contentartifact_blocking():
+                    return (
+                        publication.published_artifact.select_related(
+                            "content_artifact",
+                            "content_artifact__artifact",
+                        )
+                        .get(relative_path=rel_path)
+                        .content_artifact
+                    )
+
+                ca = await loop.run_in_executor(None, get_contentartifact_blocking)
             except ObjectDoesNotExist:
                 pass
             else:
@@ -554,9 +687,15 @@ class Handler:
             # pass-through
             if publication.pass_through:
                 try:
-                    ca = ContentArtifact.objects.select_related("artifact").get(
-                        content__in=publication.repository_version.content, relative_path=rel_path
-                    )
+
+                    def get_contentartifact_blocking():
+                        ca = ContentArtifact.objects.select_related("artifact").get(
+                            content__in=publication.repository_version.content,
+                            relative_path=rel_path,
+                        )
+                        return ca
+
+                    ca = await loop.run_in_executor(None, get_contentartifact_blocking)
                 except MultipleObjectsReturned:
                     log.error(
                         _("Multiple (pass-through) matches for {b}/{p}"),
@@ -568,21 +707,21 @@ class Handler:
                 else:
                     return await self._determine_serve_or_scan(ca, request, headers)
 
-        repo_version = getattr(distro, "repository_version", None)
-        repository = getattr(distro, "repository", None)
-
-        if repository or repo_version:
-            if repository:
-                repo_version = distro.repository.latest_version()
-
+        if repo_version and not publication and not distro.SERVE_FROM_PUBLICATION:
             if rel_path == "" or rel_path[-1] == "/":
-                try:
-                    index_path = "{}index.html".format(rel_path)
-                    ContentArtifact.objects.get(
+                index_path = "{}index.html".format(rel_path)
+
+                def contentartifact_exists_blocking():
+                    return ContentArtifact.objects.filter(
                         content__in=repo_version.content, relative_path=index_path
-                    )
+                    ).exists()
+
+                contentartifact_exists = await loop.run_in_executor(
+                    None, contentartifact_exists_blocking
+                )
+                if contentartifact_exists:
                     rel_path = index_path
-                except ObjectDoesNotExist:
+                else:
                     dir_list = await self.list_directory(repo_version, None, rel_path)
                     dir_list.update(distro.content_handler_list_directory(rel_path))
                     return HTTPOk(
@@ -590,9 +729,14 @@ class Handler:
                     )
 
             try:
-                ca = ContentArtifact.objects.select_related("artifact").get(
-                    content__in=repo_version.content, relative_path=rel_path
-                )
+
+                def get_contentartifact_blocking():
+                    ca = ContentArtifact.objects.select_related("artifact").get(
+                        content__in=repo_version.content, relative_path=rel_path
+                    )
+                    return ca
+
+                ca = await loop.run_in_executor(None, get_contentartifact_blocking)
             except MultipleObjectsReturned:
                 log.error(
                     _("Multiple (pass-through) matches for {b}/{p}"),
@@ -605,16 +749,27 @@ class Handler:
                 return await self._determine_serve_or_scan(ca, request, headers)
 
         if distro.remote:
-            remote = distro.remote.cast()
-            url = remote.get_remote_artifact_url(rel_path)
+
+            def cast_remote_blocking():
+                return distro.remote.cast()
+
+            remote = await loop.run_in_executor(None, cast_remote_blocking)
+
             try:
-                ra = RemoteArtifact.objects.select_related(
-                    "content_artifact",
-                    "content_artifact__artifact",
-                ).get(remote=remote, url=url)
+                url = remote.get_remote_artifact_url(rel_path)
+
+                def get_remote_artifact_blocking():
+                    ra = RemoteArtifact.objects.select_related(
+                        "content_artifact",
+                        "content_artifact__artifact",
+                        "remote",
+                    ).get(remote=remote, url=url)
+                    return ra
+
+                ra = await loop.run_in_executor(None, get_remote_artifact_blocking)
                 ca = ra.content_artifact
                 if ca.artifact:
-                    return self._serve_content_artifact(ca, headers)
+                    return await self._serve_content_artifact(ca, headers)
                 else:
                     return await self._stream_content_artifact(
                         request, StreamResponse(headers=headers), ca
@@ -650,13 +805,18 @@ class Handler:
                 :class:`~pulpcore.plugin.models.ContentArtifact` returned the binary data needed for
                 the client.
         """
-        for remote_artifact in content_artifact.remoteartifact_set.all():
+
+        def get_remote_artifacts_blocking():
+            return list(content_artifact.remoteartifact_set.all())
+
+        remote_artifacts = await loop.run_in_executor(None, get_remote_artifacts_blocking)
+        for remote_artifact in remote_artifacts:
             try:
                 response = await self._stream_remote_artifact(request, response, remote_artifact)
                 return response
 
             except (ClientResponseError, UnsupportedDigestValidationError) as e:
-                log.warn(
+                log.warning(
                     _("Could not download remote artifact at '{}': {}").format(
                         remote_artifact.url, str(e)
                     )
@@ -695,7 +855,22 @@ class Handler:
                 with transaction.atomic():
                     artifact.save()
             except IntegrityError:
-                artifact = Artifact.objects.get(artifact.q())
+                try:
+                    artifact = Artifact.objects.get(artifact.q())
+                    artifact.touch()
+                except (Artifact.DoesNotExist, DatabaseError):
+                    # it's possible that orphan cleanup deleted the artifact
+                    # so fall back to creating a new artifact again
+                    artifact = Artifact(
+                        **download_result.artifact_attributes, file=download_result.path
+                    )
+                    artifact.save()
+                else:
+                    # The file needs to be unlinked because it was not used to create an artifact.
+                    # The artifact must have already been saved while servicing another request for
+                    # the same artifact.
+                    os.unlink(download_result.path)
+
             update_content_artifact = True
             if content_artifact._state.adding:
                 # This is the first time pull-through content was requested.
@@ -731,7 +906,7 @@ class Handler:
                 content_artifact.save()
         return artifact
 
-    def _serve_content_artifact(self, content_artifact, headers):
+    async def _serve_content_artifact(self, content_artifact, headers):
         """
         Handle response for a Content Artifact with the file present.
 
@@ -750,18 +925,22 @@ class Handler:
         Returns:
             The :class:`aiohttp.web.FileResponse` for the file.
         """
+        artifact_file = content_artifact.artifact.file
+        artifact_name = artifact_file.name
+
         if settings.DEFAULT_FILE_STORAGE == "pulpcore.app.models.storage.FileSystem":
-            filename = content_artifact.artifact.file.name
-            return FileResponse(os.path.join(settings.MEDIA_ROOT, filename), headers=headers)
+            return FileResponse(os.path.join(settings.MEDIA_ROOT, artifact_name), headers=headers)
         elif settings.DEFAULT_FILE_STORAGE == "storages.backends.s3boto3.S3Boto3Storage":
-            artifact_file = content_artifact.artifact.file
             content_disposition = f"attachment;filename={content_artifact.relative_path}"
             parameters = {"ResponseContentDisposition": content_disposition}
-            url = artifact_file.storage.url(artifact_file.name, parameters=parameters)
+            if headers.get("Content-Type"):
+                parameters["ResponseContentType"] = headers.get("Content-Type")
+            url = URL(
+                artifact_file.storage.url(artifact_file.name, parameters=parameters), encoded=True
+            )
             raise HTTPFound(url)
         elif settings.DEFAULT_FILE_STORAGE == "storages.backends.azure_storage.AzureStorage":
-            artifact_file = content_artifact.artifact.file
-            url = artifact_file.storage.url(artifact_file.name)
+            url = URL(artifact_file.storage.url(artifact_name), encoded=True)
             raise HTTPFound(url)
         else:
             raise NotImplementedError()
@@ -783,17 +962,56 @@ class Handler:
                 the client.
 
         """
-        remote = remote_artifact.remote.cast()
 
-        async def handle_headers(headers):
+        def cast_remote_blocking():
+            return remote_artifact.remote.cast()
+
+        remote = await loop.run_in_executor(None, cast_remote_blocking)
+
+        range_start, range_stop = request.http_range.start, request.http_range.stop
+        if range_start or range_stop:
+            response.set_status(206)
+
+        async def handle_response_headers(headers):
             for name, value in headers.items():
-                if name.lower() in self.hop_by_hop_headers:
+                lower_name = name.lower()
+                if lower_name in self.hop_by_hop_headers:
                     continue
+
+                if response.status == 206 and lower_name == "content-length":
+                    range_bytes = int(value)
+                    start = 0 if range_start is None else range_start
+                    stop = range_bytes if range_stop is None else range_stop
+
+                    range_bytes = range_bytes - range_start
+                    range_bytes = range_bytes - (int(value) - stop)
+                    response.headers[name] = str(range_bytes)
+
+                    response.headers["Content-Range"] = "bytes {0}-{1}/{2}".format(
+                        start, stop - start + 1, int(value)
+                    )
+                    continue
+
                 response.headers[name] = value
             await response.prepare(request)
 
+        data_size_handled = 0
+
         async def handle_data(data):
-            await response.write(data)
+            nonlocal data_size_handled
+            if range_start or range_stop:
+                start_byte_pos = 0
+                end_byte_pos = len(data)
+                if range_start:
+                    start_byte_pos = max(0, range_start - data_size_handled)
+                if range_stop:
+                    end_byte_pos = min(len(data), range_stop - data_size_handled)
+
+                data_for_client = data[start_byte_pos:end_byte_pos]
+                await response.write(data_for_client)
+                data_size_handled = data_size_handled + len(data)
+            else:
+                await response.write(data)
             if remote.policy != Remote.STREAMED:
                 await original_handle_data(data)
 
@@ -802,7 +1020,7 @@ class Handler:
                 await original_finalize()
 
         downloader = remote.get_downloader(
-            remote_artifact=remote_artifact, headers_ready_callback=handle_headers
+            remote_artifact=remote_artifact, headers_ready_callback=handle_response_headers
         )
         original_handle_data = downloader.handle_data
         downloader.handle_data = handle_data
@@ -811,7 +1029,11 @@ class Handler:
         download_result = await downloader.run()
 
         if remote.policy != Remote.STREAMED:
-            self._save_artifact(download_result, remote_artifact)
+
+            def save_artifact_blocking():
+                self._save_artifact(download_result, remote_artifact)
+
+            await asyncio.shield(loop.run_in_executor(None, save_artifact_blocking))
         await response.write_eof()
 
         if response.status == 404:

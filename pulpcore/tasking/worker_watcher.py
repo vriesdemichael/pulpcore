@@ -17,18 +17,6 @@ from django.db import transaction
 _logger = logging.getLogger(__name__)
 
 
-def mark_worker_online(worker_name):
-    """Sets some bookkeeping values on the worker record for tracking worker state
-
-    Args:
-        worker_name (str): The hostname of the worker
-    """
-    worker, created = Worker.objects.get_or_create(name=worker_name)
-    worker.gracefully_stopped = False
-    worker.cleaned_up = False
-    worker.save()
-
-
 def handle_worker_heartbeat(worker_name):
     """
     This is a generic function for updating worker heartbeat records.
@@ -56,6 +44,8 @@ def handle_worker_heartbeat(worker_name):
     )
 
     _logger.debug(msg)
+
+    return worker
 
 
 def check_worker_processes():
@@ -101,7 +91,7 @@ def check_worker_processes():
     if resource_manager_count == 0:
         msg = _(
             "There are 0 pulpcore-resource-manager processes running. Pulp will not operate "
-            "correctly without at least one pulpcore-resource-mananger process running."
+            "correctly without at least one pulpcore-resource-manager process running."
         )
         _logger.error(msg)
 

@@ -9,9 +9,8 @@ import unittest
 
 from pulp_smash import api, cli, config
 from pulp_smash.utils import uuid4, get_pulp_setting
-from pulp_smash.pulp3.bindings import monitor_task, monitor_task_group
+from pulp_smash.pulp3.bindings import delete_orphans, monitor_task, monitor_task_group
 from pulp_smash.pulp3.utils import (
-    delete_orphans,
     gen_repo,
 )
 
@@ -24,10 +23,10 @@ from pulpcore.tests.functional.api.using_plugin.utils import (
 
 from pulpcore.client.pulpcore import (
     ApiClient as CoreApiClient,
-    ExportersCoreExportsApi,
+    ExportersPulpExportsApi,
     ExportersPulpApi,
-    ImportersCoreImportCheckApi,
-    ImportersCoreImportsApi,
+    ImportersPulpImportCheckApi,
+    ImportersPulpImportsApi,
     ImportersPulpApi,
 )
 
@@ -160,11 +159,11 @@ class PulpImportTestCase(unittest.TestCase):
         cls.versions_api = RepositoriesFileVersionsApi(cls.file_client)
         cls.content_api = ContentFilesApi(cls.file_client)
         cls.exporter_api = ExportersPulpApi(cls.core_client)
-        cls.exports_api = ExportersCoreExportsApi(cls.core_client)
+        cls.exports_api = ExportersPulpExportsApi(cls.core_client)
         cls.importer_api = ImportersPulpApi(cls.core_client)
-        cls.imports_api = ImportersCoreImportsApi(cls.core_client)
+        cls.imports_api = ImportersPulpImportsApi(cls.core_client)
 
-        cls.import_check_api = ImportersCoreImportCheckApi(cls.core_client)
+        cls.import_check_api = ImportersPulpImportCheckApi(cls.core_client)
 
         (cls.import_repos, cls.export_repos, cls.remotes) = cls._setup_repositories()
         cls.exporter = cls._create_exporter()
@@ -199,7 +198,7 @@ class PulpImportTestCase(unittest.TestCase):
             cls.repo_api.delete(repo.pulp_href)
         delete_exporter(cls.exporter)
         cls._delete_import_check_structures()
-        delete_orphans(cls.cfg)
+        delete_orphans()
 
     def _create_importer(self, name=None, cleanup=True, exported_repos=None):
         """Create an importer."""

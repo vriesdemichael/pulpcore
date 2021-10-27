@@ -7,7 +7,6 @@ from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
 
-from pulpcore.app.access_policy import AccessPolicyFromDB
 from pulpcore.app.models import Task, TaskGroup, Worker
 from pulpcore.app.serializers import (
     MinimalTaskSerializer,
@@ -32,6 +31,7 @@ class TaskFilter(BaseFilterSet):
     state = filters.ChoiceFilter(choices=TASK_CHOICES)
     worker = HyperlinkRelatedFilter()
     name = filters.CharFilter()
+    logging_cid = filters.CharFilter()
     started_at = IsoDateTimeFilter(field_name="started_at")
     finished_at = IsoDateTimeFilter(field_name="finished_at")
     parent_task = HyperlinkRelatedFilter()
@@ -43,9 +43,10 @@ class TaskFilter(BaseFilterSet):
     class Meta:
         model = Task
         fields = {
-            "name": ["contains"],
             "state": ["exact", "in"],
             "worker": ["exact", "in"],
+            "name": ["contains"],
+            "logging_cid": ["exact", "contains"],
             "started_at": DATETIME_FILTER_OPTIONS,
             "finished_at": DATETIME_FILTER_OPTIONS,
             "parent_task": ["exact"],
@@ -66,7 +67,6 @@ class TaskViewSet(
     minimal_serializer_class = MinimalTaskSerializer
     filter_backends = (OrderingFilter, DjangoFilterBackend)
     ordering = "-pulp_created"
-    permission_classes = (AccessPolicyFromDB,)
     queryset_filtering_required_permission = "core.view_task"
 
     DEFAULT_ACCESS_POLICY = {
@@ -114,7 +114,11 @@ class TaskViewSet(
             raise ValidationError(_("The only acceptable value for 'state' is 'canceled'."))
         task = cancel_task(task.pk)
         # Check whether task is actually canceled
-        http_status = None if task.state == TASK_STATES.CANCELED else status.HTTP_409_CONFLICT
+        http_status = (
+            None
+            if task.state in [TASK_STATES.CANCELING, TASK_STATES.CANCELED]
+            else status.HTTP_409_CONFLICT
+        )
         serializer = self.serializer_class(task, context={"request": request})
         return Response(serializer.data, status=http_status)
 

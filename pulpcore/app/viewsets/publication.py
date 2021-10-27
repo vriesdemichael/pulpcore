@@ -1,22 +1,27 @@
 from gettext import gettext as _
 
+from django.shortcuts import get_object_or_404
 from django_filters import Filter
 from django_filters.rest_framework import DjangoFilterBackend, filters
+from drf_spectacular.utils import extend_schema
 from rest_framework import mixins, serializers
 from rest_framework.filters import OrderingFilter
+from rest_framework.decorators import action
+from rest_framework.response import Response
 
 from pulpcore.app.models import (
-    BaseDistribution,
     ContentGuard,
+    RBACContentGuard,
     Distribution,
     Publication,
     Content,
 )
 from pulpcore.app.serializers import (
-    BaseDistributionSerializer,
     ContentGuardSerializer,
     DistributionSerializer,
     PublicationSerializer,
+    RBACContentGuardSerializer,
+    RBACContentGuardPermissionSerializer,
 )
 from pulpcore.app.viewsets import (
     AsyncCreateMixin,
@@ -31,7 +36,6 @@ from pulpcore.app.viewsets.custom_filters import (
     LabelSelectFilter,
     RepositoryVersionFilter,
 )
-from pulpcore.app.loggers import deprecation_logger
 
 
 class PublicationContentFilter(Filter):
@@ -132,35 +136,98 @@ class ContentGuardViewSet(
     """
 
 
+class RBACContentGuardViewSet(ContentGuardViewSet):
+    """
+    Viewset for creating contentguards that use RBAC to protect content.
+    Has add and remove actions for managing permission for users and groups to download content
+    protected by this guard.
+    """
+
+    endpoint_name = "rbac"
+    serializer_class = RBACContentGuardSerializer
+    queryset = RBACContentGuard.objects.all()
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list"],
+                "principal": "authenticated",
+                "effect": "allow",
+            },
+            {
+                "action": ["create"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_perms:core.add_rbaccontentguard",
+            },
+            {
+                "action": ["retrieve"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_obj_perms:core.view_rbaccontentguard",
+            },
+            {
+                "action": ["update", "partial_update", "assign_permission", "remove_permission"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_obj_perms:core.change_rbaccontentguard",
+            },
+            {
+                "action": ["destroy"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_obj_perms:core.delete_rbaccontentguard",
+            },
+            {
+                "action": ["download"],  # This is the action for the content guard permit
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_model_or_obj_perms:core.download_rbaccontentguard",
+            },
+        ],
+        "permissions_assignment": [
+            {
+                "function": "add_for_object_creator",
+                "parameters": None,
+                "permissions": [
+                    "core.add_rbaccontentguard",
+                    "core.view_rbaccontentguard",
+                    "core.change_rbaccontentguard",
+                    "core.delete_rbaccontentguard",
+                    "core.download_rbaccontentguard",
+                ],
+            },
+        ],
+    }
+
+    @extend_schema(summary="Add download permission", responses={201: RBACContentGuardSerializer})
+    @action(methods=["post"], detail=True, serializer_class=RBACContentGuardPermissionSerializer)
+    def assign_permission(self, request, pk):
+        """Give users and groups the `download` permission"""
+        guard = get_object_or_404(RBACContentGuard, pk=pk)
+        names = self.get_serializer(data=request.data)
+        names.is_valid(raise_exception=True)
+        guard.add_can_download(users=names.data["usernames"], groups=names.data["groupnames"])
+        self.serializer_class = RBACContentGuardSerializer
+        serializer = self.get_serializer(guard)
+        return Response(serializer.data, status=201)
+
+    @extend_schema(
+        summary="Remove download permission", responses={201: RBACContentGuardSerializer}
+    )
+    @action(methods=["post"], detail=True, serializer_class=RBACContentGuardPermissionSerializer)
+    def remove_permission(self, request, pk):
+        """Remove `download` permission from users and groups"""
+        guard = get_object_or_404(RBACContentGuard, pk=pk)
+        names = self.get_serializer(data=request.data)
+        names.is_valid(raise_exception=True)
+        guard.remove_can_download(users=names.data["usernames"], groups=names.data["groupnames"])
+        self.serializer_class = RBACContentGuardSerializer
+        serializer = self.get_serializer(guard)
+        return Response(serializer.data, status=201)
+
+
 class DistributionFilter(BaseFilterSet):
-    # e.g.
-    # /?name=foo
-    # /?name__in=foo,bar
-    # /?base_path__contains=foo
-    # /?base_path__icontains=foo
-    name = filters.CharFilter()
-    base_path = filters.CharFilter()
-    pulp_label_select = LabelSelectFilter()
-
-    def __init__(self, *args, **kwargs):
-        """Initialize a DistributionFilter and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "DistributionFilter is deprecated and could be removed as early as "
-                "pulpcore==3.13; use pulpcore.plugin.serializers.NewDistributionFilter instead."
-            )
-        )
-        return super().__init__(*args, **kwargs)
-
-    class Meta:
-        model = BaseDistribution
-        fields = {
-            "name": NAME_FILTER_OPTIONS,
-            "base_path": ["exact", "contains", "icontains", "in"],
-        }
-
-
-class NewDistributionFilter(BaseFilterSet):
     # e.g.
     # /?name=foo
     # /?name__in=foo,bar
@@ -176,40 +243,6 @@ class NewDistributionFilter(BaseFilterSet):
             "name": NAME_FILTER_OPTIONS,
             "base_path": ["exact", "contains", "icontains", "in"],
         }
-
-
-class BaseDistributionViewSet(
-    NamedModelViewSet,
-    mixins.RetrieveModelMixin,
-    mixins.ListModelMixin,
-    AsyncCreateMixin,
-    AsyncRemoveMixin,
-    AsyncUpdateMixin,
-):
-    """
-    Provides read and list methods and also provides asynchronous CUD methods to dispatch tasks
-    with reservation that lock all Distributions preventing race conditions during base_path
-    checking.
-    """
-
-    endpoint_name = "distributions"
-    queryset = BaseDistribution.objects.all()
-    serializer_class = BaseDistributionSerializer
-    filterset_class = DistributionFilter
-
-    def __init__(self, *args, **kwargs):
-        """Initialize a BaseDistributionViewSet and emit deprecation warnings"""
-        deprecation_logger.warn(
-            _(
-                "BaseDistributionViewSet is deprecated and could be removed as early as "
-                "pulpcore==3.13; use pulpcore.plugin.viewsets.DistributionViewset instead."
-            )
-        )
-        return super().__init__(*args, **kwargs)
-
-    def async_reserved_resources(self, instance):
-        """Return resource that locks all Distributions."""
-        return ["/api/v3/distributions/"]
 
 
 class DistributionViewSet(
@@ -229,7 +262,7 @@ class DistributionViewSet(
     endpoint_name = "distributions"
     queryset = Distribution.objects.all()
     serializer_class = DistributionSerializer
-    filterset_class = NewDistributionFilter
+    filterset_class = DistributionFilter
 
     def async_reserved_resources(self, instance):
         """Return resource that locks all Distributions."""

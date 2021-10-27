@@ -27,10 +27,24 @@ else
   BRANCH="${GITHUB_REF##refs/tags/}"
 fi
 
+COMMIT_MSG=$(git log --format=%B --no-merges -1)
+export COMMIT_MSG
+
+if [[ "$TEST" == "upgrade" ]]; then
+  pip install -r functest_requirements.txt
+  git checkout -b ci_upgrade_test
+  cp -R .github /tmp/.github
+  cp -R .ci /tmp/.ci
+  git checkout $FROM_PULPCORE_BRANCH
+  rm -rf .ci .github
+  cp -R /tmp/.github .
+  cp -R /tmp/.ci .
+fi
+
 if [[ "$TEST" == "plugin-from-pypi" ]]; then
   COMPONENT_VERSION=$(http https://pypi.org/pypi/pulpcore/json | jq -r '.info.version')
 else
-  COMPONENT_VERSION=$(sed -ne "s/\s*version=['\"]\(.*\)['\"][\s,]*/\1/p" setup.py)
+  COMPONENT_VERSION=$(sed -ne "s/\s*version.*=.*['\"]\(.*\)['\"][\s,]*/\1/p" setup.py)
 fi
 mkdir .ci/ansible/vars || true
 echo "---" > .ci/ansible/vars/main.yaml
@@ -40,9 +54,6 @@ echo "component_version: '${COMPONENT_VERSION}'" >> .ci/ansible/vars/main.yaml
 
 export PRE_BEFORE_INSTALL=$PWD/.github/workflows/scripts/pre_before_install.sh
 export POST_BEFORE_INSTALL=$PWD/.github/workflows/scripts/post_before_install.sh
-
-COMMIT_MSG=$(git log --format=%B --no-merges -1)
-export COMMIT_MSG
 
 if [ -f $PRE_BEFORE_INSTALL ]; then
   source $PRE_BEFORE_INSTALL
@@ -72,7 +83,10 @@ else
   export CI_BASE_IMAGE=
 fi
 
+
 cd ..
+
+
 
 git clone --depth=1 https://github.com/pulp/pulp-openapi-generator.git
 if [ -n "$PULP_OPENAPI_GENERATOR_PR_NUMBER" ]; then
@@ -93,29 +107,48 @@ fi
 
 cd pulp-cli
 pip install -e .
-pulp config create --base-url http://pulp --location tests/settings.toml
+pulp config create --base-url https://pulp --location tests/cli.toml 
+mkdir ~/.config/pulp
+cp tests/cli.toml ~/.config/pulp/cli.toml
 cd ..
 
 
 
 
+git clone --depth=1 https://github.com/pulp/pulp_file.git --branch main
+cd pulp_file
 
-
-git clone --depth=1 https://github.com/pulp/pulp_file.git --branch master
 if [ -n "$PULP_FILE_PR_NUMBER" ]; then
-  cd pulp_file
   git fetch --depth=1 origin pull/$PULP_FILE_PR_NUMBER/head:$PULP_FILE_PR_NUMBER
   git checkout $PULP_FILE_PR_NUMBER
+fi
+
+cd ..
+
+git clone --depth=1 https://github.com/pulp/pulp-certguard.git --branch master
+cd pulp-certguard
+
+if [ -n "$PULP_CERTGUARD_PR_NUMBER" ]; then
+  git fetch --depth=1 origin pull/$PULP_CERTGUARD_PR_NUMBER/head:$PULP_CERTGUARD_PR_NUMBER
+  git checkout $PULP_CERTGUARD_PR_NUMBER
+fi
+
+cd ..
+
+
+if [[ "$TEST" == "upgrade" ]]; then
+  cd pulp-certguard
+  git checkout -b ci_upgrade_test
+  git fetch --depth=1 origin heads/$FROM_PULP_CERTGUARD_BRANCH:$FROM_PULP_CERTGUARD_BRANCH
+  git checkout $FROM_PULP_CERTGUARD_BRANCH
+  cd ..
+  cd pulp_file
+  git checkout -b ci_upgrade_test
+  git fetch --depth=1 origin heads/$FROM_PULP_FILE_BRANCH:$FROM_PULP_FILE_BRANCH
+  git checkout $FROM_PULP_FILE_BRANCH
   cd ..
 fi
 
-git clone --depth=1 https://github.com/pulp/pulp-certguard.git --branch master
-if [ -n "$PULP_CERTGUARD_PR_NUMBER" ]; then
-  cd pulp-certguard
-  git fetch --depth=1 origin pull/$PULP_CERTGUARD_PR_NUMBER/head:$PULP_CERTGUARD_PR_NUMBER
-  git checkout $PULP_CERTGUARD_PR_NUMBER
-  cd ..
-fi
 
 # Intall requirements for ansible playbooks
 pip install docker netaddr boto3 ansible

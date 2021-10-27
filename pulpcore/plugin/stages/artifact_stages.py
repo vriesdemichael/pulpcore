@@ -8,10 +8,12 @@ from gettext import gettext as _
 import logging
 from typing import Optional
 
+from asgiref.sync import sync_to_async
 from django.db.models import Prefetch, prefetch_related_objects
 
 from pulpcore.plugin.exceptions import UnsupportedDigestValidationError
 from pulpcore.plugin.models import Artifact, ContentArtifact, ProgressReport, RemoteArtifact
+from pulpcore.plugin.sync import sync_to_async_iterable
 
 from .api import Stage
 from ...app.models.content import ScanResult
@@ -92,17 +94,18 @@ class QueryExistingArtifacts(Stage):
             # swap it out with the existing one.
             for digest_type, digests in artifact_digests_by_type.items():
                 query_params = {"{attr}__in".format(attr=digest_type): digests}
-                existing_artifacts = Artifact.objects.filter(**query_params).only(digest_type)
+                existing_artifacts_qs = Artifact.objects.filter(**query_params).only(digest_type)
+                existing_artifacts = sync_to_async_iterable(existing_artifacts_qs)
+                await sync_to_async(existing_artifacts_qs.touch)()
                 for d_content in batch:
                     for d_artifact in d_content.d_artifacts:
                         artifact_digest = getattr(d_artifact.artifact, digest_type)
                         if artifact_digest:
-                            for result in existing_artifacts:
+                            async for result in existing_artifacts:
                                 result_digest = getattr(result, digest_type)
                                 if result_digest == artifact_digest:
                                     d_artifact.artifact = result
                                     break
-
             for d_content in batch:
                 await self.put(d_content)
 
@@ -163,7 +166,7 @@ class ArtifactDownloader(Stage):
         #    Set to None if stage is shutdown.
         content_get_task = _add_to_pending(content_iterator.__anext__())
 
-        with ProgressReport(
+        async with ProgressReport(
             message="Downloading Artifacts", code="sync.downloading.artifacts"
         ) as pb:
             try:
@@ -179,7 +182,7 @@ class ArtifactDownloader(Stage):
                                 content_get_task = None
                         else:
                             pb.done += task.result()  # download_count
-                            pb.save()
+                            await pb.asave()
 
                     if content_get_task and content_get_task not in pending:  # not yet shutdown
                         if len(pending) < self.max_concurrent_content:
@@ -244,7 +247,7 @@ class ArtifactSaver(Stage):
             if da_to_save:
                 for d_artifact, artifact in zip(
                     da_to_save,
-                    Artifact.objects.bulk_get_or_create(
+                    await sync_to_async(Artifact.objects.bulk_get_or_create)(
                         d_artifact.artifact for d_artifact in da_to_save
                     ),
                 ):
@@ -262,6 +265,10 @@ class RemoteArtifactSaver(Stage):
     :class:`~pulpcore.plugin.stages.DeclarativeArtifact`.
     """
 
+    def __init__(self, fix_mismatched_remote_artifacts=False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fix_mismatched_remote_artifacts = fix_mismatched_remote_artifacts
+
     async def run(self):
         """
         The coroutine for this stage.
@@ -270,11 +277,13 @@ class RemoteArtifactSaver(Stage):
             The coroutine for this stage.
         """
         async for batch in self.batches():
-            RemoteArtifact.objects.bulk_get_or_create(self._needed_remote_artifacts(batch))
+            await sync_to_async(RemoteArtifact.objects.bulk_get_or_create)(
+                await self._needed_remote_artifacts(batch)
+            )
             for d_content in batch:
                 await self.put(d_content)
 
-    def _needed_remote_artifacts(self, batch):
+    async def _needed_remote_artifacts(self, batch):
         """
         Build a list of only :class:`~pulpcore.plugin.models.RemoteArtifact` that need
         to be created for the batch.
@@ -287,17 +296,11 @@ class RemoteArtifactSaver(Stage):
         """
         remotes_present = set()
         for d_content in batch:
-            # If the attribute is set in a previous batch on the very first item in this batch, the
-            # rest of the items in this batch will not get the attribute set during prefetch.
-            # https://code.djangoproject.com/ticket/32089
-            if hasattr(d_content.content, "_remote_artifact_saver_cas"):
-                delattr(d_content.content, "_remote_artifact_saver_cas")
-
             for d_artifact in d_content.d_artifacts:
                 if d_artifact.remote:
                     remotes_present.add(d_artifact.remote)
 
-        prefetch_related_objects(
+        await sync_to_async(prefetch_related_objects)(
             [d_c.content for d_c in batch],
             Prefetch(
                 "contentartifact_set",
@@ -322,16 +325,61 @@ class RemoteArtifactSaver(Stage):
                 if not d_artifact.remote:
                     continue
 
-                for content_artifact in d_content.content._remote_artifact_saver_cas:
+                async for content_artifact in sync_to_async_iterable(
+                    d_content.content._remote_artifact_saver_cas
+                ):
                     if d_artifact.relative_path == content_artifact.relative_path:
                         break
                 else:
-                    msg = _('No declared artifact with relative path "{rp}" for content "{c}"')
-                    raise ValueError(
-                        msg.format(rp=content_artifact.relative_path, c=d_content.content)
-                    )
+                    if self.fix_mismatched_remote_artifacts:
+                        # We couldn't match an DeclarativeArtifact to a ContentArtifact by rel_path.
+                        # If there are any paths available (i.e., other ContentArtifacts for this
+                        # Artifact), complain to the logs, pick the rel_path from the last
+                        # ContentArtifact we examined, and continue.
+                        #
+                        # If we can't find anything to choose from (can that even happen?), fail
+                        # the process.
+                        avail_paths = ",".join(
+                            [
+                                ca.relative_path
+                                for ca in d_content.content._remote_artifact_saver_cas
+                            ]
+                        )
+                        if avail_paths:
+                            msg = _(
+                                "No declared artifact with relative path '{rp}' for content '{c}'"
+                                " from remote '{rname}'. Using last from available-paths : '{ap}'"
+                            )
+                            log.warning(
+                                msg.format(
+                                    rp=d_artifact.relative_path,
+                                    c=d_content.content.filename,
+                                    rname=d_artifact.remote.name,
+                                    ap=avail_paths,
+                                )
+                            )
+                            d_artifact.relative_path = content_artifact.relative_path
+                        else:
+                            msg = _(
+                                "No declared artifact with relative path '{rp}' for content '{c}'"
+                                " from remote '{rname}', and no paths available."
+                            )
+                            raise ValueError(
+                                msg.format(
+                                    rp=d_artifact.relative_path,
+                                    c=d_content.content.filename,
+                                    rname=d_artifact.remote.name,
+                                )
+                            )
+                    else:
+                        msg = _('No declared artifact with relative path "{rp}" for content "{c}"')
+                        raise ValueError(
+                            msg.format(rp=d_artifact.relative_path, c=d_content.content)
+                        )
 
-                for remote_artifact in content_artifact._remote_artifact_saver_ras:
+                async for remote_artifact in sync_to_async_iterable(
+                    content_artifact._remote_artifact_saver_ras
+                ):
                     if remote_artifact.remote_id == d_artifact.remote.pk:
                         break
                 else:

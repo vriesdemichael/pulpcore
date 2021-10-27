@@ -9,43 +9,15 @@ from pulpcore.app.serializers import (
     ModelSerializer,
     ProgressReportSerializer,
     RelatedField,
+    RelatedResourceField,
     TaskGroupStatusCountField,
 )
 from pulpcore.constants import TASK_STATES
-from pulpcore.app.util import get_viewset_for_model, get_request_without_query_params
 
 
-class CreatedResourceSerializer(RelatedField):
-    def to_representation(self, data):
-        # If the content object was deleted
-        if data.content_object is None:
-            return None
-        try:
-            if not data.content_object.complete:
-                return None
-        except AttributeError:
-            pass
-
-        # query parameters can be ignored because we are looking just for 'pulp_href'; still,
-        # we need to use the request object due to contextual references required by some
-        # serializers
-        request = get_request_without_query_params(self.context)
-
-        viewset = get_viewset_for_model(data.content_object)
-        serializer = viewset.serializer_class(data.content_object, context={"request": request})
-        return serializer.data.get("pulp_href")
-
+class CreatedResourceSerializer(RelatedResourceField):
     class Meta:
         model = models.CreatedResource
-        fields = []
-
-
-class ReservedResourcesSerializer(ModelSerializer):
-    def to_representation(self, instance):
-        return instance.resource
-
-    class Meta:
-        model = models.ReservedResourceRecord
         fields = []
 
 
@@ -54,7 +26,7 @@ class TaskSerializer(ModelSerializer):
     state = serializers.CharField(
         help_text=_(
             "The current state of the task. The possible values include:"
-            " 'waiting', 'skipped', 'running', 'completed', 'failed' and 'canceled'."
+            " 'waiting', 'skipped', 'running', 'completed', 'failed', 'canceled' and 'canceling'."
         ),
         read_only=True,
     )
@@ -106,7 +78,11 @@ class TaskSerializer(ModelSerializer):
         read_only=True,
         view_name="None",  # This is a polymorphic field. The serializer does not need a view name.
     )
-    reserved_resources_record = ReservedResourcesSerializer(many=True, read_only=True)
+    reserved_resources_record = serializers.ListField(
+        child=serializers.CharField(),
+        help_text=_("A list of resources required by that task."),
+        read_only=True,
+    )
 
     class Meta:
         model = models.Task
@@ -164,7 +140,11 @@ class TaskGroupSerializer(ModelSerializer):
     failed = TaskGroupStatusCountField(
         state=TASK_STATES.FAILED, help_text=_("Number of tasks in the 'failed' state")
     )
+    canceling = TaskGroupStatusCountField(
+        state=TASK_STATES.CANCELING, help_text=_("Number of tasks in the 'canceling' state")
+    )
     group_progress_reports = GroupProgressReportSerializer(many=True, read_only=True)
+    tasks = MinimalTaskSerializer(many=True, read_only=True)
 
     class Meta:
         model = models.TaskGroup
@@ -178,7 +158,9 @@ class TaskGroupSerializer(ModelSerializer):
             "completed",
             "canceled",
             "failed",
+            "canceling",
             "group_progress_reports",
+            "tasks",
         )
 
 

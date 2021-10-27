@@ -11,6 +11,7 @@ from .base import (  # noqa
     NestedIdentityField,
     NestedRelatedField,
     RelatedField,
+    RelatedResourceField,
     ValidateFieldsMixin,
     validate_unknown_fields,
 )
@@ -32,6 +33,10 @@ from .fields import (  # noqa
     TaskGroupStatusCountField,
 )
 from .access_policy import AccessPolicySerializer  # noqa
+from .acs import (  # noqa
+    AlternateContentSourcePathSerializer,
+    AlternateContentSourceSerializer,
+)
 from .content import (  # noqa
     ArtifactSerializer,
     ContentChecksumSerializer,
@@ -43,8 +48,8 @@ from .content import (  # noqa
 from .exporter import (  # noqa
     ExporterSerializer,
     ExportSerializer,
+    FilesystemExportSerializer,
     FilesystemExporterSerializer,
-    PublicationExportSerializer,
     PulpExporterSerializer,
     PulpExportSerializer,
 )
@@ -57,14 +62,14 @@ from .importer import (  # noqa
     PulpImporterSerializer,
     PulpImportSerializer,
 )
+from .orphans import OrphansCleanupSerializer  # noqa
 from .progress import GroupProgressReportSerializer, ProgressReportSerializer  # noqa
 from .publication import (  # noqa
-    BaseDistributionSerializer,
     ContentGuardSerializer,
     DistributionSerializer,
-    PublicationDistributionSerializer,
     PublicationSerializer,
-    RepositoryVersionDistributionSerializer,
+    RBACContentGuardSerializer,
+    RBACContentGuardPermissionSerializer,
 )
 from .repository import (  # noqa
     RemoteSerializer,
@@ -74,6 +79,7 @@ from .repository import (  # noqa
     RepositoryVersionSerializer,
 )
 from .repair import RepairSerializer  # noqa
+from .reclaim import ReclaimSpaceSerializer  # noqa
 from .task import (  # noqa
     MinimalTaskSerializer,
     TaskCancelSerializer,

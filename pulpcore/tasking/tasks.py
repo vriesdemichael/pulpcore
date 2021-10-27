@@ -4,9 +4,10 @@ import time
 import uuid
 from gettext import gettext as _
 
-from django.db import IntegrityError, transaction, models
+from django.conf import settings
+from django.db import IntegrityError, transaction, models, connection as db_connection
 from django.db.models import Model
-from django_guid.middleware import GuidMiddleware
+from django_guid import get_guid, set_guid
 from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue
 from rq.job import Job, get_current_job
@@ -14,10 +15,8 @@ from rq.job import Job, get_current_job
 from pulpcore.app.loggers import deprecation_logger
 from pulpcore.app.models import (
     ReservedResource,
-    ReservedResourceRecord,
     Task,
     TaskReservedResource,
-    TaskReservedResourceRecord,
     Worker,
 )
 from pulpcore.constants import TASK_STATES
@@ -48,15 +47,19 @@ def _acquire_worker(resources):
     """
     # Find a worker who already has one of the reservations, it is safe to send this work to them
     try:
-        return (
+        worker = (
             Worker.objects.select_for_update()
             .filter(pk__in=Worker.objects.filter(reservations__resource__in=resources))
             .get()
         )
+        if worker.online:
+            return worker
     except Worker.MultipleObjectsReturned:
         raise Worker.DoesNotExist
     except Worker.DoesNotExist:
         pass
+    else:  # no Exception raised -> worker is offline; wait for it to be cleaned up
+        raise Worker.DoesNotExist
 
     # Otherwise, return any available worker at random
     workers_qs = Worker.objects.online_workers().exclude(
@@ -104,35 +107,9 @@ def _queue_reserved_task(func, inner_task_id, resources, inner_args, inner_kwarg
     """
     redis_conn = connection.get_redis_connection()
     task_status = Task.objects.get(pk=inner_task_id)
-    GuidMiddleware.set_guid(task_status.logging_cid)
-    task_name = func.__module__ + "." + func.__name__
+    set_guid(task_status.logging_cid)
 
     while True:
-        if task_name == "pulpcore.app.tasks.orphan.orphan_cleanup":
-            if ReservedResource.objects.exists():
-                # wait until there are no reservations
-                time.sleep(0.25)
-                continue
-            else:
-                rq_worker = util.get_current_worker()
-                worker = Worker.objects.get(name=rq_worker.name)
-                task_status.worker = worker
-                task_status.set_running()
-                q = Queue("resource-manager", connection=redis_conn, is_async=False)
-                try:
-                    q.enqueue(
-                        func,
-                        args=inner_args,
-                        kwargs=inner_kwargs,
-                        job_id=inner_task_id,
-                        job_timeout=TASK_TIMEOUT,
-                        **options,
-                    )
-                    task_status.set_completed()
-                except RedisConnectionError as e:
-                    task_status.set_failed(e, None)
-                return
-
         try:
             with transaction.atomic():
                 # lock the worker - there is a similar lock in mark_worker_offline()
@@ -140,13 +117,15 @@ def _queue_reserved_task(func, inner_task_id, resources, inner_args, inner_kwarg
 
                 # Attempt to lock all resources by their urls. Must be atomic to prevent deadlocks.
                 for resource in resources:
-                    if worker.reservations.filter(resource=resource).exists():
+                    if worker.reservations.select_for_update().filter(resource=resource).exists():
                         reservation = worker.reservations.get(resource=resource)
                     else:
                         reservation = ReservedResource.objects.create(
                             worker=worker, resource=resource
                         )
                     TaskReservedResource.objects.create(resource=reservation, task=task_status)
+                worker.cleaned_up = False
+                worker.save(update_fields=["cleaned_up"])
         except (Worker.DoesNotExist, IntegrityError):
             # if worker is ready, or we have a worker but we can't create the reservations, wait
             time.sleep(0.25)
@@ -171,21 +150,33 @@ def _queue_reserved_task(func, inner_task_id, resources, inner_args, inner_kwarg
         task_status.set_failed(e, None)
 
 
-class NonJSONWarningEncoder(json.JSONEncoder):
+class UUIDEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, uuid.UUID):
             return str(obj)
-        try:
-            return json.JSONEncoder.default(self, obj)
-        except TypeError:
-            deprecation_logger.warn(
-                _(
-                    "The argument {obj} is of type {type}, which is not JSON serializable. The use "
-                    "of non JSON serializable objects for `args` and `kwargs` to tasks is "
-                    "deprecated as of pulpcore==3.12."
-                ).format(obj=obj, type=type(obj))
-            )
+        deprecation_logger.warning(
+            _(
+                "The argument {obj} is of type {type}, which is not JSON serializable. The use "
+                "of non JSON serializable objects for `args` and `kwargs` to tasks is "
+                "deprecated as of pulpcore==3.12."
+            ).format(obj=obj, type=type(obj))
+        )
+        if settings.USE_NEW_WORKER_TYPE:
+            return super().default(obj)
+        else:
             return None
+
+
+def _validate_and_get_resources(resources):
+    resource_set = set()
+    for r in resources:
+        if isinstance(r, str):
+            resource_set.add(r)
+        elif isinstance(r, Model):
+            resource_set.add(util.get_url(r))
+        else:
+            raise ValueError(_("Must be (str|Model)"))
+    return list(resource_set)
 
 
 def _enqueue_with_reservation(
@@ -198,21 +189,14 @@ def _enqueue_with_reservation(
     if not options:
         options = dict()
 
-    def as_url(r):
-        if isinstance(r, str):
-            return r
-        if isinstance(r, Model):
-            return util.get_url(r)
-        raise ValueError(_("Must be (str|Model)"))
-
-    resources = {as_url(r) for r in resources}
+    resources = _validate_and_get_resources(resources)
     inner_task_id = str(uuid.uuid4())
     resource_task_id = str(uuid.uuid4())
+    args_as_json = json.dumps(args, cls=UUIDEncoder)
+    kwargs_as_json = json.dumps(kwargs, cls=UUIDEncoder)
     redis_conn = connection.get_redis_connection()
     current_job = get_current_job(connection=redis_conn)
     parent_kwarg = {}
-    json.dumps(args, cls=NonJSONWarningEncoder)
-    json.dumps(kwargs, cls=NonJSONWarningEncoder)
     if current_job:
         # set the parent task of the spawned task to the current task ID (same as rq Job ID)
         parent_kwarg["parent_task"] = Task.objects.get(pk=current_job.id)
@@ -222,16 +206,16 @@ def _enqueue_with_reservation(
             pk=inner_task_id,
             _resource_job_id=resource_task_id,
             state=TASK_STATES.WAITING,
-            logging_cid=(GuidMiddleware.get_guid() or ""),
+            logging_cid=(get_guid() or ""),
             task_group=task_group,
             name=f"{func.__module__}.{func.__name__}",
+            args=args_as_json,
+            kwargs=kwargs_as_json,
+            reserved_resources_record=resources,
             **parent_kwarg,
         )
-        for resource in resources:
-            reservation_record = ReservedResourceRecord.objects.get_or_create(resource=resource)[0]
-            TaskReservedResourceRecord.objects.create(resource=reservation_record, task=task)
 
-        task_args = (func, inner_task_id, list(resources), args, kwargs, options)
+        task_args = (func, inner_task_id, resources, args, kwargs, options)
         try:
             q = Queue("resource-manager", connection=redis_conn)
             q.enqueue(
@@ -246,7 +230,15 @@ def _enqueue_with_reservation(
     return Job(id=inner_task_id, connection=redis_conn)
 
 
-def dispatch(func, resources, args=None, kwargs=None, task_group=None):
+def dispatch(
+    func,
+    resources=None,
+    args=None,
+    kwargs=None,
+    task_group=None,
+    exclusive_resources=None,
+    shared_resources=None,
+):
     """
     Enqueue a message to Pulp workers with a reservation.
 
@@ -256,20 +248,82 @@ def dispatch(func, resources, args=None, kwargs=None, task_group=None):
 
     This method creates a :class:`pulpcore.app.models.Task` object and returns it.
 
+    The values in `args` and `kwargs` must be JSON serializable, but may contain instances of
+    ``uuid.UUID``.
+
     Args:
         func (callable): The function to be run by RQ when the necessary locks are acquired.
-        resources (list): A list of resources to this task needs exclusive access to while running.
-                          Each resource can be either a `str` or a `django.models.Model` instance.
+        resources (list): A list of resources this task needs exclusive access to while running.
+            Each resource can be either a `str` or a `django.models.Model` instance. This parameter
+            is deprecated.
         args (tuple): The positional arguments to pass on to the task.
         kwargs (dict): The keyword arguments to pass on to the task.
         task_group (pulpcore.app.models.TaskGroup): A TaskGroup to add the created Task to.
+        exclusive_resources (list): A list of resources this task needs exclusive access to while
+            running. Each resource can be either a `str` or a `django.models.Model` instance.
+        shared_resources (list): A list of resources this task needs non-exclusive access to while
+            running. Each resource can be either a `str` or a `django.models.Model` instance.
 
     Returns (pulpcore.app.models.Task): The Pulp Task that was created.
 
     Raises:
         ValueError: When `resources` is an unsupported type.
     """
-    RQ_job_id = _enqueue_with_reservation(
-        func, resources=resources, args=args, kwargs=kwargs, task_group=task_group
-    )
-    return Task.objects.get(pk=RQ_job_id.id)
+    if resources is not None:
+        if exclusive_resources is not None:
+            raise RuntimeError(
+                _(
+                    "Only one of 'exclusive_resources' and 'resources' can be specified for"
+                    " dispatch."
+                )
+            )
+        deprecation_logger.warning(
+            _(
+                "The use of the 'resources' argument to 'dispatch' has been deprecated and may be"
+                " removed as soon as pulpcore==3.16. Please use 'exclusive_resources' and"
+                " 'shared_resources' instead."
+            )
+        )
+        exclusive_resources = resources
+        resources = None
+
+    if exclusive_resources is None:
+        exclusive_resources = []
+
+    if settings.USE_NEW_WORKER_TYPE:
+        args_as_json = json.dumps(args, cls=UUIDEncoder)
+        kwargs_as_json = json.dumps(kwargs, cls=UUIDEncoder)
+        resources = _validate_and_get_resources(exclusive_resources)
+        if shared_resources:
+            resources.extend(
+                (f"shared:{resource}" for resource in _validate_and_get_resources(shared_resources))
+            )
+        with transaction.atomic():
+            task = Task.objects.create(
+                state=TASK_STATES.WAITING,
+                logging_cid=(get_guid() or ""),
+                task_group=task_group,
+                name=f"{func.__module__}.{func.__name__}",
+                args=args_as_json,
+                kwargs=kwargs_as_json,
+                parent_task=Task.current(),
+                reserved_resources_record=resources,
+            )
+        # Notify workers
+        with db_connection.connection.cursor() as cursor:
+            cursor.execute("NOTIFY pulp_worker_wakeup")
+        return task
+    else:
+        deprecation_logger.warning(
+            _(
+                "You are using the traditional tasking system which will be removed in pulpcore "
+                "3.16 along with the `USE_NEW_WORKER_TYPE` setting."
+            )
+        )
+        # There is only exclusive use in the legacy tasking system
+        if shared_resources:
+            exclusive_resources = exclusive_resources + shared_resources
+        RQ_job_id = _enqueue_with_reservation(
+            func, resources=exclusive_resources, args=args, kwargs=kwargs, task_group=task_group
+        )
+        return Task.objects.get(pk=RQ_job_id.id)

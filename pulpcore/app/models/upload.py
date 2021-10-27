@@ -1,11 +1,13 @@
 import hashlib
+import os
 
 from django.core.files.base import ContentFile
 from django.db import models
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from rest_framework import serializers
 
 from pulpcore.app.models import BaseModel, fields, storage
-from pulpcore.app.models.content import HandleTempFilesMixin
 
 
 class Upload(BaseModel):
@@ -33,16 +35,17 @@ class Upload(BaseModel):
             raise serializers.ValidationError("Checksum does not match chunk upload.")
 
         upload_chunk = UploadChunk(upload=self, offset=offset, size=len(chunk))
-        upload_chunk.file.save("", ContentFile(chunk_read))
+        filename = os.path.basename(upload_chunk.storage_path(""))
+        upload_chunk.file.save(filename, ContentFile(chunk_read))
 
 
-class UploadChunk(HandleTempFilesMixin, BaseModel):
+class UploadChunk(BaseModel):
     """
     A chunk for an uploaded file.
 
     Fields:
 
-        file (fields.ArtifactFileField): A file where the uploaded chunk is stored.
+        file (fields.FileField): A file where the uploaded chunk is stored.
         upload (models.ForeignKey): Upload this chunk belongs to.
         offset (models.BigIntegerField): Start of the chunk in bytes.
         size (models.BigIntegerField): Size of the chunk in bytes.
@@ -63,13 +66,7 @@ class UploadChunk(HandleTempFilesMixin, BaseModel):
     offset = models.BigIntegerField()
     size = models.BigIntegerField()
 
-    def delete(self, *args, **kwargs):
-        """
-        Delete UploadChunk model and the file associated with the model
 
-        Args:
-            args (list): list of positional arguments for Model.delete()
-            kwargs (dict): dictionary of keyword arguments to pass to Model.delete()
-        """
-        super().delete(*args, **kwargs)
-        self.file.delete(save=False)
+@receiver(post_delete, sender=UploadChunk)
+def upload_chunk_delete(instance, **kwargs):
+    instance.file.delete(save=False)

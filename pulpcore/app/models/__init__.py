@@ -8,10 +8,12 @@ from .base import (  # noqa
 )
 
 from .access_policy import AccessPolicy, AutoAddObjPermsMixin, AutoDeleteObjPermsMixin  # noqa
+from .acs import AlternateContentSource, AlternateContentSourcePath  # noqa
 from .content import (  # noqa
     Artifact,
     AsciiArmoredDetachedSigningService,
     Content,
+    ContentManager,
     ContentArtifact,
     PulpTemporaryFile,
     RemoteArtifact,
@@ -24,6 +26,7 @@ from .exporter import (  # noqa
     Export,
     ExportedResource,
     Exporter,
+    FilesystemExport,
     FilesystemExporter,
     PulpExport,
     PulpExporter,
@@ -35,14 +38,12 @@ from .importer import (  # noqa
     PulpImporter,
 )
 from .publication import (  # noqa
-    BaseDistribution,
     ContentGuard,
     Distribution,
     Publication,
-    PublicationDistribution,
     PublishedArtifact,
     PublishedMetadata,
-    RepositoryVersionDistribution,
+    RBACContentGuard,
 )
 from .repository import (  # noqa
     Remote,
@@ -57,11 +58,9 @@ from .status import ContentAppStatus  # noqa
 from .task import (  # noqa
     CreatedResource,
     ReservedResource,
-    ReservedResourceRecord,
     Task,
     TaskGroup,
     TaskReservedResource,
-    TaskReservedResourceRecord,
     Worker,
 )
 from .upload import (  # noqa

@@ -9,6 +9,8 @@ from .base import (  # noqa
 
 from .access_policy import AccessPolicyViewSet  # noqa
 
+from .acs import AlternateContentSourceViewSet  # noqa
+
 from .content import (  # noqa
     ArtifactFilter,
     ArtifactViewSet,
@@ -26,6 +28,8 @@ from .custom_filters import (  # noqa
 from .exporter import (  # noqa
     ExportViewSet,
     ExporterViewSet,
+    FilesystemExporterViewSet,
+    FilesystemExportViewSet,
     PulpExporterViewSet,
     PulpExportViewSet,
 )
@@ -35,18 +39,19 @@ from .importer import (  # noqa
     PulpImportViewSet,
     PulpImporterViewSet,
 )
+from .orphans import OrphansCleanupViewset  # noqa
 from .publication import (  # noqa
-    BaseDistributionViewSet,
     ContentGuardFilter,
     ContentGuardViewSet,
     DistributionFilter,
     DistributionViewSet,
     ListContentGuardViewSet,
     ListPublicationViewSet,
-    NewDistributionFilter,
     PublicationFilter,
     PublicationViewSet,
+    RBACContentGuardViewSet,
 )
+from .reclaim import ReclaimSpaceViewSet  # noqa
 from .repository import (  # noqa
     ImmutableRepositoryViewSet,
     ListRepositoryViewSet,
