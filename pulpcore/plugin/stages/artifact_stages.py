@@ -521,7 +521,7 @@ class ArtifactScanner(Stage):
                         contains_virus = True
 
             sr = ScanResult(contains_virus=contains_virus, scan_command=self.scan_command, content=d_content.content)
-            sr.save()
+            await sync_to_async(sr.save)()
 
             if not contains_virus:
                 await self.put(d_content)
@@ -564,7 +564,7 @@ class ScanResultEjection(Stage):
         from pulpcore.plugin.stages import DeclarativeContent
         d_content: DeclarativeContent
         async for d_content in self.items():
-            sr = self.get_scan_result_for(d_content)
+            sr = await sync_to_async(self.get_scan_result_for)(d_content)
             if sr and sr.contains_virus:
                 log.info("Will not process %s because of an earlier found virus", d_content)
                 continue  # do not pass to next stage
