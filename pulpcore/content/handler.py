@@ -482,7 +482,11 @@ class Handler:
 
         if av_enabled:
             needs_av_scan = True
-            policy = RemoteArtifact.objects.get(content_artifact=ca).remote.cast().policy
+
+            def get_policy_blocking():
+                return list(ca.remoteartifact_set.all())[0].remote.cast().policy
+
+            policy = await loop.run_in_executor(None, get_policy_blocking)
 
             # Determine if a scan is needed
             sr = self.get_scan_result_for(ca.content, security_scan_shell)

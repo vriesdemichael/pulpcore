@@ -789,7 +789,7 @@ class ScanResult(BaseModel, QueryMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    contains_virus = models.NullBooleanField()
+    contains_virus = models.BooleanField(null=True)
     scan_command = models.TextField()
 
     content = models.ForeignKey(Content, on_delete=models.CASCADE)
