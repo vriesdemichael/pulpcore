@@ -125,8 +125,6 @@ urlpatterns = [
     path(f"{API_ROOT}repair/", RepairView.as_view()),
     path(f"{API_ROOT}scan/", ScanView.as_view()),
     path(f"{API_ROOT}status/", StatusView.as_view()),
-    path(
-        r"^{api_root}orphans/cleanup/".format(api_root=API_ROOT),
     path(f"{API_ROOT}repair/", RepairView.as_view()),
     path(f"{API_ROOT}status/", StatusView.as_view()),
     path(
