@@ -1,6 +1,8 @@
 import http.client
 from gettext import gettext as _
 
+from aiohttp.web_exceptions import HTTPClientError
+
 from .base import PulpException
 
 
@@ -26,3 +28,14 @@ class MissingResource(PulpException):
         resources_str = ", ".join("%s=%s" % (k, v) for k, v in self.resources.items())
         msg = _("The following resources are missing: %s") % resources_str
         return msg.encode("utf-8")
+
+
+class VirusFoundError(HTTPClientError):
+    status_code = 409
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault(
+            "text",
+            "A virus was found in the file you are trying to access."
+        )
+        super().__init__(**kwargs)

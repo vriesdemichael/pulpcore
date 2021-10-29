@@ -16,4 +16,4 @@ from .orphan import orphan_cleanup  # noqa
 
 from .reclaim_space import reclaim_space  # noqa
 
-from .repository import repair_all_artifacts  # noqa
+from .repository import repair_all_artifacts, scan_all_artifacts  # noqa

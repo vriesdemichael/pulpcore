@@ -18,6 +18,7 @@ from pulpcore.app.viewsets import (
     OrphansCleanupViewset,
     ReclaimSpaceViewSet,
 )
+from pulpcore.app.views.scan import ScanView
 from pulpcore.constants import API_ROOT
 
 log = logging.getLogger(__name__)
@@ -121,6 +122,9 @@ for viewset in sorted_by_depth:
 root_router = routers.DefaultRouter()
 
 urlpatterns = [
+    path(f"{API_ROOT}repair/", RepairView.as_view()),
+    path(f"{API_ROOT}scan/", ScanView.as_view()),
+    path(f"{API_ROOT}status/", StatusView.as_view()),
     path(f"{API_ROOT}repair/", RepairView.as_view()),
     path(f"{API_ROOT}status/", StatusView.as_view()),
     path(

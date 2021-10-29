@@ -1,16 +1,20 @@
+import os
+import shlex
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from gettext import gettext as _
 from logging import getLogger
 import asyncio
 import hashlib
 
+from django.conf import settings
 from asgiref.sync import sync_to_async
 from django.core.files.storage import default_storage
 from django.db import transaction
 from rest_framework.serializers import ValidationError
 
 from pulpcore.app import models
-from pulpcore.app.models import ProgressReport
+from pulpcore.app.models import ProgressReport, ScanResult
 from pulpcore.plugin.sync import sync_to_async_iterable
 
 log = getLogger(__name__)
@@ -191,6 +195,31 @@ def repair_all_artifacts(verify_checksums):
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(_repair_artifacts_for_content(verify_checksums=verify_checksums))
+
+
+def scan_all_artifacts(scan_command):
+    log.info("Scanning all ContentArtifacts with %s", scan_command)
+    parsed_cmd = shlex.split(scan_command)
+
+    ca_set = models.ContentArtifact.objects.all()
+    ca: models.ContentArtifact
+    for ca in ca_set:
+        if not ca.artifact:
+            log.info("Skipped %s because no artifact was attached to it", ca.content)
+            continue
+        log.info("Processing %s", ca.content)
+
+        file_location = os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name)
+        complete_scan_call = [*parsed_cmd, file_location]
+        status_code = subprocess.call(complete_scan_call)
+        log.info("Scan: %s %s", complete_scan_call, status_code)
+
+        sr, created = ScanResult.objects.update_or_create(contains_virus=bool(status_code), content=ca.content, scan_command=scan_command)
+        log.info("Stored scan result %s, created = %s ", sr, created)
+
+        if sr.contains_virus:
+            log.info("Found virus in %s, removing artifact", ca.artifact)
+            ca.delete()
 
 
 def add_and_remove(repository_pk, add_content_units, remove_content_units, base_version_pk=None):

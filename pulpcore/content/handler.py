@@ -3,16 +3,25 @@ import logging
 import mimetypes
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+import shlex
+import subprocess
+import tempfile
 from gettext import gettext as _
 
 from aiohttp.client_exceptions import ClientResponseError
 from aiohttp.web import FileResponse, StreamResponse, HTTPOk
 from aiohttp.web_exceptions import HTTPForbidden, HTTPFound, HTTPNotFound
+from pulpcore.exceptions.http import VirusFoundError
+
+from pulpcore.download import BaseDownloader, DownloadResult
 from yarl import URL
 
 from asgiref.sync import sync_to_async
 
 import django
+from django.utils import timezone
+
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "pulpcore.app.settings")
 django.setup()
@@ -34,7 +43,7 @@ from pulpcore.app.models import (  # noqa: E402: module level not at top of file
     Distribution,
     Publication,
     Remote,
-    RemoteArtifact,
+    RemoteArtifact, ScanResult,
 )
 from pulpcore.exceptions import UnsupportedDigestValidationError  # noqa: E402
 
@@ -399,6 +408,176 @@ class Handler:
 
         return await sync_to_async(list_directory_blocking)()
 
+    async def _serve_from_readable(self, request, readable, headers):
+        """
+        Serve an artifact directly from a readable (such as from the django-storage backends)
+        args:
+            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            readable: A readable source (must implement the open and read functions)
+            headers (dict): A dictionary of response headers.
+
+        Returns:
+            The :class:`aiohttp.web.StreamResponse` for the file.
+
+        """
+
+        response = StreamResponse(headers=headers)
+        await response.prepare(request)
+
+        chunk_size = 256 * 1024
+        while chunk := readable.read(chunk_size):
+            await response.write(chunk)
+        await response.write_eof()
+
+        return response
+
+    async def _determine_serve_or_scan(self, ca: ContentArtifact, request, headers):
+        """
+        This function will either:
+        1. Serve the artifact contained in the content artifact as usual.
+        2. a) Retrieve the targeted artifact
+           b) store it in the storage backend
+           c) scan it and store the scan result
+           d) serve it from the storage backend
+
+        A scan will be required if
+        1. Virus scanning is set up and
+        2. There was no previous scan result using the same configured scan command or
+        3. The stored scan result is no longer valid (from before the previous midnight)
+
+
+         Args:
+            ca (:class:`~pulpcore.plugin.models.ContentArtifact`): The ContentArtifact
+                to fetch and then stream back to the client
+            request(:class:`~aiohttp.web.Request`): The request to prepare a response for.
+            headers (dict): A dictionary of response headers.
+
+        Raises:
+            VirusFoundError: When the requested ca contains a virus.
+
+        Returns:
+            :class:`aiohttp.web.StreamResponse` or :class:`aiohttp.web.FileResponse`: The response
+                streamed back to the client.
+        """
+        # TODO check latest changes
+        security_scan_shell = os.environ.get("SECURITY_SCAN_SHELL", "")
+        av_enabled = security_scan_shell != ""
+
+        if av_enabled:
+            needs_av_scan = True
+            def get_content():
+                content = ca.content
+                log.info(ca.content)
+                return content
+            content = await sync_to_async(get_content)()
+            log.info(f"2: {content=}")
+
+            def get_policy_blocking():
+                try:
+                    return list(ca.remoteartifact_set.all())[0].remote.cast().policy
+                except IndexError:
+                    return None  # this happens for generated index pages like pythons /simple
+
+            policy = await sync_to_async(get_policy_blocking)()
+            if not policy:
+                needs_av_scan = False  # artifact without remote content --> no need for scan
+
+            # Determine if a scan is needed
+            try:
+                sr = await sync_to_async(ScanResult.objects.get)(
+                    content=content,
+                    scan_command=security_scan_shell
+                )
+            except ScanResult.DoesNotExist:
+                sr = None
+
+            if sr and ca.artifact and policy != Remote.STREAMED:
+                last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO make configurable
+                if last_midnight < sr.pulp_last_updated:
+                    needs_av_scan = False
+
+            # Download if needed
+            if not ca.artifact or policy == Remote.STREAMED:
+                log.info("Artifact not yet available for %s, downloading", ca)
+
+                remote_artifacts = await sync_to_async(lambda: list(ca.remoteartifact_set.all()))()
+
+                for remote_artifact in remote_artifacts:
+                    async def get_downloader() -> BaseDownloader:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        asyncio.get_running_loop()
+                        remote: Remote = await sync_to_async(lambda: remote_artifact.remote.cast())()
+                        return remote.download_factory.build(remote_artifact.url)
+
+                    downloader = await get_downloader()
+
+                    download_result: DownloadResult = await downloader.run()
+                    log.info("Downloaded %s", remote_artifact)
+                    await sync_to_async(self._save_artifact)(download_result, remote_artifact)
+                    log.info("Stored %s", remote_artifact)
+                    # return ca.remoteartifact_set.all()
+                # await asyncio.gather(*[synchronous_download(ra) for ra in await sync_to_async(get_remote_artifacts)(ca)])
+
+            if needs_av_scan:
+                scan_command = shlex.split(security_scan_shell)
+                # TODO dont create copy when file is in local storage
+                with tempfile.NamedTemporaryFile(dir=settings.WORKING_DIRECTORY, mode="wb") as tmp_scan_file:
+                    with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
+                        chunk_size = 256 * 1024
+                        chunk = stored_file.read(chunk_size)
+                        while chunk:
+                            tmp_scan_file.write(chunk)
+                            chunk = stored_file.read(chunk_size)
+
+                        scan_command.append(os.path.abspath(tmp_scan_file.name))
+                        status_code = subprocess.call(scan_command)
+
+                if sr:
+                    sr.contains_virus = bool(status_code)
+                else:
+                    sr = ScanResult(contains_virus=bool(status_code), content=content, scan_command=security_scan_shell)
+                await sync_to_async(sr.save)()
+                log.info(f"Scanned {ca} {content} with '{security_scan_shell}'"
+                         f"contains_virus = {await sync_to_async(lambda: sr.contains_virus)()}")
+
+                if sr.contains_virus:
+                    log.info("Found virus in %s, removing artifact", ca.artifact)
+                    os.unlink(os.path.join(settings.MEDIA_ROOT, ca.artifact.file.name))
+                    if policy != Remote.STREAMED:
+                        ca.delete()  # Should cascade into artifact as well
+                    else:
+                        artifact = ca.artifact
+                        ca.artifact = None
+                        await sync_to_async(ca.save)()
+                        await sync_to_async(artifact.delete)()
+                    raise VirusFoundError
+            else:
+                log.info("Scan not needed for %s due to previous scan result", ca)
+
+            try:
+                # TODO dont store STREAMED on backend (although it might be good to do so anyway, to prevent memory overloads
+                # TODO or implement a chunked upload from the filesystem, that just requires creating a hook that deletes the file afterwards, complicated stuff.
+                # TODO serve downloaded files from temp scan file instead of backend when it is not in the backend yet.
+                with ca.artifact.file.storage.open(ca.artifact.storage_path('ignored'), "rb") as stored_file:
+                    # Read the file from the backed to serve to the client
+                    # TODO redirect to backend instead like in the serve function (s3/azure) (does this work for streamed?)
+                    return await self._serve_from_readable(request, stored_file, headers)
+            finally:
+                if policy == Remote.STREAMED:
+                    # When streamed mode is enabled, remove the artifact part of the content artifact so it will download again with the next request (this is sketchy)
+                    artifact = ca.artifact
+                    ca.artifact = None
+                    await sync_to_async(ca.save)()
+                    await sync_to_async(artifact.delete)()
+                    log.info("Artifact is deleted due to streamed policy")
+
+        else:
+            if ca.artifact:
+                return self._serve_content_artifact(ca, headers)
+            else:
+                return await self._stream_content_artifact(request, StreamResponse(headers=headers), ca)
+
     async def _match_and_stream(self, path, request):
         """
         Match the path and stream results either from the filesystem or by downloading new data.
@@ -438,7 +617,7 @@ class Handler:
         await sync_to_async(self._permit)(request, distro)
 
         rel_path = path.lstrip("/")
-        rel_path = rel_path[len(distro.base_path) :]
+        rel_path = rel_path[len(distro.base_path):]
         rel_path = rel_path.lstrip("/")
 
         content_handler_result = await sync_to_async(distro.content_handler)(rel_path)
@@ -513,12 +692,7 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                if ca.artifact:
-                    return await self._serve_content_artifact(ca, headers)
-                else:
-                    return await self._stream_content_artifact(
-                        request, StreamResponse(headers=headers), ca
-                    )
+                return await self._determine_serve_or_scan(ca, request, headers)
 
             # pass-through
             if publication.pass_through:
@@ -541,12 +715,7 @@ class Handler:
                 except ObjectDoesNotExist:
                     pass
                 else:
-                    if ca.artifact:
-                        return await self._serve_content_artifact(ca, headers)
-                    else:
-                        return await self._stream_content_artifact(
-                            request, StreamResponse(headers=headers), ca
-                        )
+                    return await self._determine_serve_or_scan(ca, request, headers)
 
         if repo_version and not publication and not distro.SERVE_FROM_PUBLICATION:
             if rel_path == "" or rel_path[-1] == "/":
@@ -587,12 +756,7 @@ class Handler:
             except ObjectDoesNotExist:
                 pass
             else:
-                if ca.artifact:
-                    return await self._serve_content_artifact(ca, headers)
-                else:
-                    return await self._stream_content_artifact(
-                        request, StreamResponse(headers=headers), ca
-                    )
+                return await self._determine_serve_or_scan(ca, request, headers)
 
         if distro.remote:
 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 
 from .api import create_pipeline, EndStage
@@ -8,6 +9,8 @@ from .artifact_stages import (
     ArtifactSaver,
     QueryExistingArtifacts,
     RemoteArtifactSaver,
+    ArtifactScanner,
+    ScanResultEjection,
 )
 from .content_stages import (
     ContentAssociation,
@@ -131,8 +134,15 @@ class DeclarativeVersion:
             self.first_stage,
             QueryExistingArtifacts(),
         ]
+
+        scanner_command = os.environ.get("SECURITY_SCAN_SHELL", "")
+        if scanner_command:
+            pipeline.append(ScanResultEjection(scanner_command))
+
+
         if self.acs:
             pipeline.append(ACSArtifactHandler())
+
         pipeline.extend(
             [
                 ArtifactDownloader(),
@@ -143,7 +153,10 @@ class DeclarativeVersion:
                 ResolveContentFutures(),
             ]
         )
+        if scanner_command:
+            pipeline.append(ArtifactScanner(scanner_command))
         return pipeline
+
 
     def create(self):
         """

@@ -1,4 +1,8 @@
 import asyncio
+import os
+import shlex
+import subprocess
+import sys
 from collections import defaultdict
 from gettext import gettext as _
 import logging
@@ -17,6 +21,8 @@ from pulpcore.plugin.models import (
 from pulpcore.plugin.sync import sync_to_async_iterable
 
 from .api import Stage
+from ...app.models.content import ScanResult
+from ...app.settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -476,3 +482,91 @@ class ACSArtifactHandler(Stage):
 
             for d_content in batch:
                 await self.put(d_content)
+
+
+class ArtifactScanner(Stage):
+    """
+    Takes in units of DeclarativeContent
+    Outputs units which did not contain viruses.
+
+    """
+
+    def __init__(self, scan_command):
+        super().__init__()
+        self.scan_command = scan_command
+        if not self.scan_command:
+            raise ValueError("No scan command was supplied")
+        self.av_call = shlex.split(self.scan_command)
+
+    async def run(self):
+
+        from pulpcore.plugin.stages import DeclarativeContent
+        d_content: DeclarativeContent
+
+        async for d_content in self.items():
+            contains_virus = False
+            for d_artifact in d_content.d_artifacts:
+                # TODO implement other storage backends (now incorrectly assumes FileStorage)
+                if d_artifact.deferred_download:
+                    contains_virus = None  # indicates not scanned yet
+                    break  # expect all downloads to be deferred
+                else:
+                    filepath = os.path.join(settings.MEDIA_ROOT, d_artifact.artifact.file.name)
+                    scan_cmd = [*self.av_call, filepath]
+
+                    log.info("Scanning %s with %s", d_content, scan_cmd)
+                    status_code = subprocess.call(scan_cmd)
+                    if status_code != 0:
+                        log.info("Found virus in artifact of %s", d_content.content)
+                        contains_virus = True
+
+            sr = ScanResult(contains_virus=contains_virus, scan_command=self.scan_command, content=d_content.content)
+            await sync_to_async(sr.save)()
+
+            if not contains_virus:
+                await self.put(d_content)
+            else:
+                self.cleanup_infected_content(d_content)
+
+    @staticmethod
+    def cleanup_infected_content(d_content):
+        for d_artifact in d_content.d_artifacts:
+            os.unlink(os.path.join(settings.MEDIA_ROOT, d_artifact.artifact.file.name))  # delete file
+            ca: ContentArtifact = ContentArtifact.objects.get(content=d_content, artifact=d_artifact)
+            ca.delete()
+            d_artifact.artifact.delete()
+
+
+class ScanResultEjection(Stage):
+    """
+    Checks if there is an existing scan result for the given DeclarativeContent. This stage will only pass Content that
+     has not been scanned yet or does not contain a virus in one of the artifacts.
+
+    """
+
+    def __init__(self, scan_command):
+        super().__init__()
+        self.scan_command = scan_command
+        if not self.scan_command:
+            raise ValueError("No scan command was supplied")
+
+    def get_scan_result_for(self, d_content):
+        try:
+            return ScanResult.objects.get(
+                content=d_content.content,
+                scan_command=self.scan_command
+            )
+
+        except ScanResult.DoesNotExist:
+            return None
+
+    async def run(self):
+        from pulpcore.plugin.stages import DeclarativeContent
+        d_content: DeclarativeContent
+        async for d_content in self.items():
+            sr = await sync_to_async(self.get_scan_result_for)(d_content)
+            if sr and sr.contains_virus:
+                log.info("Will not process %s because of an earlier found virus", d_content)
+                continue  # do not pass to next stage
+
+            await self.put(d_content)
