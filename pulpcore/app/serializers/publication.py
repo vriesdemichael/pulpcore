@@ -1,6 +1,7 @@
 from gettext import gettext as _
 
 from django.db.models import Q
+from drf_spectacular.utils import extend_schema_field
 from guardian.shortcuts import get_users_with_perms, get_groups_with_perms
 from rest_framework import serializers
 from rest_framework.validators import UniqueValidator
@@ -82,6 +83,7 @@ class RBACContentGuardSerializer(ContentGuardSerializer):
     users = serializers.SerializerMethodField()
     groups = serializers.SerializerMethodField()
 
+    @extend_schema_field(GroupUserSerializer(many=True))
     def get_users(self, obj):
         """Finds all the users with this object's download permission."""
         users = get_users_with_perms(
@@ -89,6 +91,7 @@ class RBACContentGuardSerializer(ContentGuardSerializer):
         )
         return GroupUserSerializer(users, many=True, context=self.context).data
 
+    @extend_schema_field(GroupSerializer(many=True))
     def get_groups(self, obj):
         """Finds all the groups with this object's download permission."""
         groups = get_groups_with_perms(obj, attach_perms=True)
@@ -223,14 +226,14 @@ class DistributionSerializer(ModelSerializer):
     def validate(self, data):
         super().validate(data)
 
-        repository_provided = data.get("repository", None) or (
-            self.instance and self.instance.repository
+        repository_provided = data.get(
+            "repository", (self.instance and self.instance.repository) or None
         )
-        repository_version_provided = data.get("repository_version", None) or (
-            self.instance and self.instance.repository_version
+        repository_version_provided = data.get(
+            "repository_version", (self.instance and self.instance.repository_version) or None
         )
-        publication_provided = data.get("publication", None) or (
-            self.instance and self.instance.publication
+        publication_provided = data.get(
+            "publication", (self.instance and self.instance.publication) or None
         )
 
         if publication_provided and repository_version_provided:
@@ -247,14 +250,12 @@ class DistributionSerializer(ModelSerializer):
                     "may be used simultaneously."
                 )
             )
-        # TODO: https://pulp.plan.io/issues/8762
 
-        # elif repository_provided and publication_provided:
-        #     raise serializers.ValidationError(
-        #         _(
-        #             "Only one of the attributes 'repository' and 'publication' "
-        #             "may be used simultaneously."
-        #         )
-        #     )
-
+        elif repository_provided and publication_provided:
+            raise serializers.ValidationError(
+                _(
+                    "Only one of the attributes 'repository' and 'publication' "
+                    "may be used simultaneously."
+                )
+            )
         return data

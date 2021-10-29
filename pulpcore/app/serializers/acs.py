@@ -62,6 +62,11 @@ class AlternateContentSourceSerializer(ModelSerializer):
             raise serializers.ValidationError(
                 _("Remote used with alternate content source must have the 'on_demand' policy.")
             )
+
+        if type(remote) not in self.Meta.model.REMOTE_TYPES:
+            raise serializers.ValidationError(
+                detail=_("Type for Remote '{}' does not match ACS type.").format(remote.name)
+            )
         return remote
 
     @transaction.atomic
@@ -85,9 +90,12 @@ class AlternateContentSourceSerializer(ModelSerializer):
                 alternate_content_source=acs.pk
             )
         }
-        to_remove = existing_paths - set(paths)
-        to_add = set(paths) - existing_paths
-
+        if paths is None:
+            to_remove = set()
+            to_add = set()
+        else:
+            to_remove = existing_paths - set(paths)
+            to_add = set(paths) - existing_paths
         if to_remove:
             models.AlternateContentSourcePath.objects.filter(path__in=to_remove).delete()
         if to_add:
@@ -115,7 +123,7 @@ class AlternateContentSourceSerializer(ModelSerializer):
         """Update an Alternate Content Source."""
         instance.name = validated_data.get("name", instance.name)
         instance.remote = validated_data.get("remote", instance.remote)
-        paths = validated_data.pop("paths", [])
+        paths = validated_data.get("paths")
         with transaction.atomic():
             self._update_paths(instance, paths)
             instance.save()
@@ -149,15 +157,6 @@ class AlternateContentSourcePathSerializer(ModelSerializer):
         required=False,
         allow_null=True,
     )
-
-    def validate_path(self, value):
-        if value == "":
-            return value
-        if value.startswith("/"):
-            raise serializers.ValidationError(_("Path cannot start with a slash."))
-        if not value.endswith("/"):
-            raise serializers.ValidationError(_("Path should end with a trailing slash."))
-        return value
 
     class Meta:
         model = models.AlternateContentSourcePath

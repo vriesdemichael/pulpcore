@@ -4,6 +4,7 @@ import tempfile
 
 from .api import create_pipeline, EndStage
 from .artifact_stages import (
+    ACSArtifactHandler,
     ArtifactDownloader,
     ArtifactSaver,
     QueryExistingArtifacts,
@@ -20,7 +21,7 @@ from .content_stages import (
 
 
 class DeclarativeVersion:
-    def __init__(self, first_stage, repository, mirror=False):
+    def __init__(self, first_stage, repository, mirror=False, acs=False):
         """
         A pipeline that creates a new :class:`~pulpcore.plugin.models.RepositoryVersion` from a
         stream of :class:`~pulpcore.plugin.stages.DeclarativeContent` objects.
@@ -104,11 +105,14 @@ class DeclarativeVersion:
                 :class:`~pulpcore.plugin.stages.DeclarativeVersion stream`, and does not remove any
                 pre-existing units in the :class:`~pulpcore.plugin.models.RepositoryVersion`.
                 'False' is the default.
+            acs (bool): When set to 'True' a new stage is added to look for
+                Alternate Content Sources.
 
         """
         self.first_stage = first_stage
         self.repository = repository
         self.mirror = mirror
+        self.acs = acs
 
     def pipeline_stages(self, new_version):
         """
@@ -142,6 +146,19 @@ class DeclarativeVersion:
             pipeline.insert(2, ScanResultEjection(scanner_command))  # after QueryExistingArtifacts
             pipeline.append(ArtifactScanner(scanner_command))
 
+        ]
+        if self.acs:
+            pipeline.append(ACSArtifactHandler())
+        pipeline.extend(
+            [
+                ArtifactDownloader(),
+                ArtifactSaver(),
+                QueryExistingContents(),
+                ContentSaver(),
+                RemoteArtifactSaver(),
+                ResolveContentFutures(),
+            ]
+        )
         return pipeline
 
     def create(self):

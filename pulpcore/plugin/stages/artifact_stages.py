@@ -6,13 +6,18 @@ import sys
 from collections import defaultdict
 from gettext import gettext as _
 import logging
-from typing import Optional
 
 from asgiref.sync import sync_to_async
-from django.db.models import Prefetch, prefetch_related_objects
+from django.db.models import Prefetch, prefetch_related_objects, Q
 
 from pulpcore.plugin.exceptions import UnsupportedDigestValidationError
-from pulpcore.plugin.models import Artifact, ContentArtifact, ProgressReport, RemoteArtifact
+from pulpcore.plugin.models import (
+    AlternateContentSource,
+    Artifact,
+    ContentArtifact,
+    ProgressReport,
+    RemoteArtifact,
+)
 from pulpcore.plugin.sync import sync_to_async_iterable
 
 from .api import Stage
@@ -22,7 +27,7 @@ from ...app.settings import settings
 log = logging.getLogger(__name__)
 
 
-def _check_for_forbidden_checksume_type(artifact):
+def _check_for_forbidden_checksum_type(artifact):
     """Check if content doesn't have forbidden checksum type.
 
     If contains forbidden checksum type it will raise ValueError,
@@ -81,7 +86,7 @@ class QueryExistingArtifacts(Stage):
                 for d_artifact in d_content.d_artifacts:
                     if d_artifact.artifact._state.adding:
                         if not d_artifact.deferred_download:
-                            _check_for_forbidden_checksume_type(d_artifact.artifact)
+                            _check_for_forbidden_checksum_type(d_artifact.artifact)
                         for digest_type in Artifact.COMMON_DIGEST_FIELDS:
                             digest_value = getattr(d_artifact.artifact, digest_type)
                             if digest_value:
@@ -94,7 +99,7 @@ class QueryExistingArtifacts(Stage):
             # swap it out with the existing one.
             for digest_type, digests in artifact_digests_by_type.items():
                 query_params = {"{attr}__in".format(attr=digest_type): digests}
-                existing_artifacts_qs = Artifact.objects.filter(**query_params).only(digest_type)
+                existing_artifacts_qs = Artifact.objects.filter(**query_params)
                 existing_artifacts = sync_to_async_iterable(existing_artifacts_qs)
                 await sync_to_async(existing_artifacts_qs.touch)()
                 for d_content in batch:
@@ -277,13 +282,11 @@ class RemoteArtifactSaver(Stage):
             The coroutine for this stage.
         """
         async for batch in self.batches():
-            await sync_to_async(RemoteArtifact.objects.bulk_get_or_create)(
-                await self._needed_remote_artifacts(batch)
-            )
+            await self._handle_remote_artifacts(batch)
             for d_content in batch:
                 await self.put(d_content)
 
-    async def _needed_remote_artifacts(self, batch):
+    async def _handle_remote_artifacts(self, batch):
         """
         Build a list of only :class:`~pulpcore.plugin.models.RemoteArtifact` that need
         to be created for the batch.
@@ -319,7 +322,8 @@ class RemoteArtifactSaver(Stage):
         #
         # We can end up with duplicates (diff pks, same sha256) in the sequence below,
         # so we store by-sha256 and then return the final values
-        needed_ras = {}  # { str(<sha256>): RemoteArtifact, ... }
+        ras_to_create = {}  # { str(<sha256>): RemoteArtifact, ... }
+        ras_to_update = {}
         for d_content in batch:
             for d_artifact in d_content.d_artifacts:
                 if not d_artifact.remote:
@@ -353,7 +357,7 @@ class RemoteArtifactSaver(Stage):
                             log.warning(
                                 msg.format(
                                     rp=d_artifact.relative_path,
-                                    c=d_content.content.filename,
+                                    c=d_content.content.natural_key(),
                                     rname=d_artifact.remote.name,
                                     ap=avail_paths,
                                 )
@@ -367,7 +371,7 @@ class RemoteArtifactSaver(Stage):
                             raise ValueError(
                                 msg.format(
                                     rp=d_artifact.relative_path,
-                                    c=d_content.content.filename,
+                                    c=d_content.content.natural_key(),
                                     rname=d_artifact.remote.name,
                                 )
                             )
@@ -380,14 +384,30 @@ class RemoteArtifactSaver(Stage):
                 async for remote_artifact in sync_to_async_iterable(
                     content_artifact._remote_artifact_saver_ras
                 ):
-                    if remote_artifact.remote_id == d_artifact.remote.pk:
+                    if d_artifact.url == remote_artifact.url:
+                        break
+
+                    if d_artifact.remote.pk == remote_artifact.remote_id:
+                        key = f"{content_artifact.pk}-{remote_artifact.remote_id}"
+                        remote_artifact.url = d_artifact.url
+                        ras_to_update[key] = remote_artifact
                         break
                 else:
                     remote_artifact = self._create_remote_artifact(d_artifact, content_artifact)
-                    key = f"{str(content_artifact.pk)}-{str(d_artifact.remote.pk)}"
-                    needed_ras[key] = remote_artifact
+                    key = f"{content_artifact.pk}-{d_artifact.remote.pk}"
+                    ras_to_create[key] = remote_artifact
 
-        return list(needed_ras.values())
+        # Make sure we create/update RemoteArtifacts in a stable order, to help
+        # prevent deadlocks in high-concurrency environments. We can rely on the
+        # Artifact sha256 for our ordering.
+        if ras_to_create:
+            ras_to_create_ordered = sorted(list(ras_to_create.values()), key=lambda x: x.sha256)
+            await sync_to_async(RemoteArtifact.objects.bulk_create)(ras_to_create_ordered)
+        if ras_to_update:
+            ras_to_update_ordered = sorted(list(ras_to_update.values()), key=lambda x: x.sha256)
+            await sync_to_async(RemoteArtifact.objects.bulk_update)(
+                ras_to_update_ordered, fields=["url"]
+            )
 
     @staticmethod
     def _create_remote_artifact(d_artifact, content_artifact):
@@ -405,6 +425,63 @@ class RemoteArtifactSaver(Stage):
         )
         ra.validate_checksums()
         return ra
+
+
+class ACSArtifactHandler(Stage):
+    """
+    API stage to download :class:`~pulpcore.plugin.models.Artifact` files from Alternate
+    Content Source if available.
+    """
+
+    async def run(self):
+        async for batch in self.batches():
+            acs_exists = await sync_to_async(AlternateContentSource.objects.exists)()
+            if acs_exists:
+                # Gather batch d_artifact checksums
+                batch_checksums = defaultdict(list)
+                for d_content in batch:
+                    for d_artifact in d_content.d_artifacts:
+                        for cks_type in d_artifact.artifact.COMMON_DIGEST_FIELDS:
+                            if getattr(d_artifact.artifact, cks_type):
+                                batch_checksums[cks_type].append(
+                                    getattr(d_artifact.artifact, cks_type)
+                                )
+
+                batch_query = Q()
+                for checksum_type in batch_checksums.keys():
+                    batch_query.add(
+                        Q(**{f"{checksum_type}__in": batch_checksums[checksum_type]}), Q.OR
+                    )
+
+                existing_ras = await sync_to_async(list)(
+                    (
+                        RemoteArtifact.objects.acs()
+                        .filter(batch_query)
+                        .only("url", "remote")
+                        .select_related("remote")
+                    )
+                )
+                existing_ras_dict = dict()
+                for ra in existing_ras:
+                    for c_type in Artifact.COMMON_DIGEST_FIELDS:
+                        checksum = await sync_to_async(getattr)(ra, c_type)
+                        if checksum:
+                            existing_ras_dict[checksum] = {
+                                "remote": ra.remote,
+                                "url": ra.url,
+                            }
+
+                for d_content in batch:
+                    for d_artifact in d_content.d_artifacts:
+                        for checksum_type in Artifact.COMMON_DIGEST_FIELDS:
+                            if getattr(d_artifact.artifact, checksum_type):
+                                checksum = getattr(d_artifact.artifact, checksum_type)
+                                if checksum in existing_ras_dict:
+                                    d_artifact.url = existing_ras_dict[checksum]["url"]
+                                    d_artifact.remote = existing_ras_dict[checksum]["remote"]
+
+            for d_content in batch:
+                await self.put(d_content)
 
 
 class ArtifactScanner(Stage):
@@ -487,7 +564,7 @@ class ScanResultEjection(Stage):
         from pulpcore.plugin.stages import DeclarativeContent
         d_content: DeclarativeContent
         async for d_content in self.items():
-            sr: Optional[ScanResult] = self.get_scan_result_for(d_content)
+            sr = self.get_scan_result_for(d_content)
             if sr and sr.contains_virus:
                 log.info("Will not process %s because of an earlier found virus", d_content)
                 continue  # do not pass to next stage

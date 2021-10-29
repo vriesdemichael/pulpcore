@@ -103,10 +103,14 @@ cmd_prefix pip3 install -r /tmp/unittest_requirements.txt
 echo "Checking for uncommitted migrations..."
 cmd_prefix bash -c "django-admin makemigrations --check --dry-run"
 
-# Run unit tests.
-cmd_prefix bash -c "PULP_DATABASES__default__USER=postgres django-admin test --noinput /usr/local/lib/python3.8/site-packages/pulpcore/tests/unit/"
+if [[ "$TEST" != "upgrade" ]]; then
+  # Run unit tests.
+  cmd_prefix bash -c "PULP_DATABASES__default__USER=postgres django-admin test --noinput /usr/local/lib/python3.8/site-packages/pulpcore/tests/unit/"
+fi
 
 # Run functional tests
+export PYTHONPATH=$REPO_ROOT/../pulp_file${PYTHONPATH:+:${PYTHONPATH}}
+export PYTHONPATH=$REPO_ROOT/../pulp-certguard${PYTHONPATH:+:${PYTHONPATH}}
 export PYTHONPATH=$REPO_ROOT${PYTHONPATH:+:${PYTHONPATH}}
 
 
@@ -115,7 +119,7 @@ if [[ "$TEST" == "upgrade" ]]; then
   sed -i "/require_pulp_plugins(/d" pulpcore/tests/functional/utils.py
 
   # Running pre upgrade tests:
-  pytest -v -r sx --color=yes --pyargs -capture=no pulpcore.tests.upgrade.pre
+  pytest -v -r sx --color=yes --pyargs --capture=no pulpcore.tests.upgrade.pre
 
   # Checking out ci_upgrade_test branch and upgrading plugins
   cmd_prefix bash -c "cd pulpcore; git checkout -f ci_upgrade_test; pip install --upgrade --force-reinstall ."
@@ -159,7 +163,7 @@ if [[ "$TEST" == "upgrade" ]]; then
 
   # Running post upgrade tests
   git checkout ci_upgrade_test -- pulpcore/tests/
-  pytest -v -r sx --color=yes --pyargs -capture=no pulpcore.tests.upgrade.post
+  pytest -v -r sx --color=yes --pyargs --capture=no pulpcore.tests.upgrade.post
   exit
 fi
 

@@ -12,6 +12,7 @@ from .base import (  # noqa
     NestedRelatedField,
     RelatedField,
     RelatedResourceField,
+    TaskGroupOperationResponseSerializer,
     ValidateFieldsMixin,
     validate_unknown_fields,
 )

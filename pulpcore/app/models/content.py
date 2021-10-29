@@ -11,6 +11,7 @@ import subprocess
 
 import gnupg
 
+from functools import lru_cache
 from itertools import chain
 
 from django.conf import settings
@@ -78,6 +79,7 @@ class BulkCreateManager(models.Manager):
         Returns:
             List of instances that were inserted into the database.
         """
+
         objs = list(objs)
         try:
             with transaction.atomic():
@@ -100,8 +102,11 @@ class BulkTouchQuerySet(models.QuerySet):
     def touch(self):
         """
         Update the ``timestamp_of_interest`` on all objects of the query.
+
+        We order-by-pk here to avoid deadlocking in high-concurrency
+        environments.
         """
-        return self.update(timestamp_of_interest=now())
+        return self.order_by("pk").update(timestamp_of_interest=now())
 
 
 class QueryMixin:
@@ -494,9 +499,22 @@ class Content(MasterModel, QueryMixin):
     @classmethod
     def natural_key_fields(cls):
         """
-        Returns a tuple of the natural key fields which usually equates to unique_together fields
+        Returns a tuple of the natural key fields which usually equates to unique_together fields.
+
+        This can be overwritten in subclasses and should return a tuple of field names.
         """
         return tuple(chain.from_iterable(cls._meta.unique_together))
+
+    @classmethod
+    @lru_cache(typed=True)
+    def _sanitized_natural_key_fields(cls):
+        """
+        This function translates the names of the key fields to their attname.
+
+        In case of foreign keys, this decodes to the corresponding `<...>_id` field preventing
+        extra DB accesses to fetch the related objects.
+        """
+        return tuple(getattr(cls, field).field.attname for field in cls.natural_key_fields())
 
     def natural_key(self):
         """
@@ -505,16 +523,13 @@ class Content(MasterModel, QueryMixin):
         Returns:
             tuple: The natural key.
         """
-        return tuple(getattr(self, f) for f in self.natural_key_fields())
+        return tuple(getattr(self, f) for f in self._sanitized_natural_key_fields())
 
     def natural_key_dict(self):
         """
         Get the model's natural key as a dictionary of keys and values.
         """
-        to_return = {}
-        for key in self.natural_key_fields():
-            to_return[key] = getattr(self, key)
-        return to_return
+        return {f: getattr(self, f) for f in self._sanitized_natural_key_fields()}
 
     @staticmethod
     def init_from_artifact_and_relative_path(artifact, relative_path):
@@ -566,6 +581,49 @@ class ContentArtifact(BaseModel, QueryMixin):
     class Meta:
         unique_together = ("content", "relative_path")
 
+    @staticmethod
+    def sort_key(ca):
+        """
+        Static method for defining a sort-key for a specified ContentArtifact.
+
+        Sorting lists of ContentArtifacts is critical for avoiding deadlocks in high-concurrency
+        environments, when multiple workers may be operating on similar sets of content at the
+        same time. Providing a stable sort-order becomes problematic when the CAs in question
+        haven't been persisted - in that case, pulp_id can't be relied on, as it will change
+        when the object is stored in the DB and its "real" key is generated.
+
+        This method produces a key based on the content/artifact represented by the CA.
+
+        Args:
+            ca (:class:`~pulpcore.plugin.models.ContentArtifact`): The CA we need a key for
+
+        Returns:
+            a tuple of (str(content-key), str(artifact-key)) that can be reliably sorted on
+        """
+        c_key = ""
+        a_key = ""
+        # It's possible to only have one of content/artifact - handle that
+        if ca.content:
+            # Some key-fields aren't str, handle that
+            c_key = "".join(map(str, ca.content.natural_key()))
+        if ca.artifact:
+            a_key = str(ca.artifact.sha256)
+        return c_key, a_key
+
+
+class RemoteArtifactQuerySet(models.QuerySet):
+    """QuerySet that provides methods for querying RemoteArtifact."""
+
+    def acs(self):
+        """Return RemoteArtifacts if they belong to an ACS."""
+        return self.filter(remote__alternatecontentsource__isnull=False)
+
+    def order_by_acs(self):
+        """Order RemoteArtifacts returning ones with ACSes first."""
+        return self.annotate(acs_count=models.Count("remote__alternatecontentsource")).order_by(
+            "-acs_count"
+        )
+
 
 class RemoteArtifact(BaseModel, QueryMixin):
     """
@@ -607,7 +665,7 @@ class RemoteArtifact(BaseModel, QueryMixin):
     content_artifact = models.ForeignKey(ContentArtifact, on_delete=models.CASCADE)
     remote = models.ForeignKey("Remote", on_delete=models.CASCADE)
 
-    objects = BulkCreateManager()
+    objects = BulkCreateManager.from_queryset(RemoteArtifactQuerySet)()
 
     def validate_checksums(self):
         """Validate if RemoteArtifact has allowed checksum or no checksum at all."""

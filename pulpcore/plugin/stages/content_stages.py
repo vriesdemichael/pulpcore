@@ -1,12 +1,10 @@
 from collections import defaultdict
-import inspect
 
 from asgiref.sync import sync_to_async
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 
-from pulpcore.app.loggers import deprecation_logger
 from pulpcore.plugin.sync import sync_to_async_iterable
 
 from pulpcore.plugin.models import Content, ContentArtifact, ProgressReport
@@ -56,16 +54,10 @@ class QueryExistingContents(Stage):
                 try:
                     await sync_to_async(model_type.objects.filter(content_q).touch)()
                 except AttributeError:
-                    from pulpcore.app.loggers import deprecation_logger
-                    from gettext import gettext as _
-
-                    deprecation_logger.warning(
-                        _(
-                            "As of pulpcore 3.14.5, plugins which declare custom ORM managers on "
-                            "their content classes should have those managers inherit from "
-                            "pulpcore.plugin.models.ContentManager. This will become a hard error "
-                            "in the future."
-                        )
+                    raise TypeError(
+                        "Plugins which declare custom ORM managers on their content classes "
+                        "should have those managers inherit from "
+                        "pulpcore.plugin.models.ContentManager."
                     )
                 async for result in sync_to_async_iterable(
                     model_type.objects.filter(content_q).iterator()
@@ -111,8 +103,11 @@ class ContentSaver(Stage):
                 to_update_ca_bulk = []
                 to_update_ca_artifact = {}
                 with transaction.atomic():
-                    if not inspect.iscoroutinefunction(self._pre_save):
-                        self._pre_save(batch)
+                    self._pre_save(batch)
+                    # Process the batch in dc.content.natural_keys order.
+                    # This prevents deadlocks when we're processing the same/similar content
+                    # in concurrent workers.
+                    batch.sort(key=lambda x: "".join(map(str, x.content.natural_key())))
                     for d_content in batch:
                         # Are we saving to the database for the first time?
                         content_already_saved = not d_content.content._state.adding
@@ -159,26 +154,18 @@ class ContentSaver(Stage):
                         # Maybe remove dict elements after to reduce memory?
                         content_artifact.artifact = to_update_ca_artifact[key]
                         to_update_ca_bulk.append(content_artifact)
+
+                    # Sort the lists we're about to do bulk updates/creates on.
+                    # We know to_update_ca_bulk entries already are in the DB, so we can enforce
+                    # order just using pulp_id.
+                    to_update_ca_bulk.sort(key=lambda x: x.pulp_id)
+                    content_artifact_bulk.sort(key=lambda x: ContentArtifact.sort_key(x))
+
                     ContentArtifact.objects.bulk_update(to_update_ca_bulk, ["artifact"])
                     ContentArtifact.objects.bulk_get_or_create(content_artifact_bulk)
-                    if not inspect.iscoroutinefunction(self._post_save):
-                        self._post_save(batch)
+                    self._post_save(batch)
 
-            if inspect.iscoroutinefunction(self._pre_save):
-                deprecation_logger.warning(
-                    "ContentSaver._pre_save() coroutine has been deprecated. Support will be "
-                    "dropped in pulpcore 3.16. ContentSaver._pre_save() should now be a "
-                    "synchronous function."
-                )
-                await self._pre_save(batch)
             await sync_to_async(process_batch)()
-            if inspect.iscoroutinefunction(self._post_save):
-                deprecation_logger.warning(
-                    "ContentSaver._post_save() coroutine has been deprecated. Support will be "
-                    "dropped in pulpcore 3.16. ContentSaver._post_save() should now be a "
-                    "synchronous function."
-                )
-                await self._post_save(batch)
             for declarative_content in batch:
                 await self.put(declarative_content)
 
