@@ -408,16 +408,6 @@ class Handler:
 
         return await sync_to_async(list_directory_blocking)()
 
-    @staticmethod
-    def get_scan_result_for(content, scan_command: str):
-        try:
-            return ScanResult.objects.get(
-                content=content,
-                scan_command=scan_command
-            )
-        except ScanResult.DoesNotExist:
-            return None
-
     async def _serve_from_readable(self, request, readable, headers):
         """
         Serve an artifact directly from a readable (such as from the django-storage backends)
@@ -435,9 +425,7 @@ class Handler:
         await response.prepare(request)
 
         chunk_size = 256 * 1024
-        chunk = readable.read(chunk_size)
-        while chunk:
-            chunk = readable.read(chunk_size)
+        while chunk := readable.read(chunk_size):
             await response.write(chunk)
         await response.write_eof()
 
@@ -477,14 +465,32 @@ class Handler:
 
         if av_enabled:
             needs_av_scan = True
+            def get_content():
+                content = ca.content
+                log.info(ca.content)
+                return content
+            content = await sync_to_async(get_content)()
+            log.info(f"2: {content=}")
 
             def get_policy_blocking():
-                return list(ca.remoteartifact_set.all())[0].remote.cast().policy
+                try:
+                    return list(ca.remoteartifact_set.all())[0].remote.cast().policy
+                except IndexError:
+                    return None  # this happens for generated index pages like pythons /simple
 
-            policy = await loop.run_in_executor(None, get_policy_blocking)
+            policy = await sync_to_async(get_policy_blocking)()
+            if not policy:
+                needs_av_scan = False  # artifact without remote content --> no need for scan
 
             # Determine if a scan is needed
-            sr = self.get_scan_result_for(ca.content, security_scan_shell)
+            try:
+                sr = await sync_to_async(ScanResult.objects.get)(
+                    content=content,
+                    scan_command=security_scan_shell
+                )
+            except ScanResult.DoesNotExist:
+                sr = None
+
             if sr and ca.artifact and policy != Remote.STREAMED:
                 last_midnight = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)  # TODO make configurable
                 if last_midnight < sr.pulp_last_updated:
@@ -494,14 +500,24 @@ class Handler:
             if not ca.artifact or policy == Remote.STREAMED:
                 log.info("Artifact not yet available for %s, downloading", ca)
 
-                async def synchronous_download(ra: RemoteArtifact):
-                    downloader: BaseDownloader = ra.remote.cast().get_downloader(ra)
-                    download_result: DownloadResult = await downloader.run()
-                    log.info("Downloaded %s", ra)
-                    self._save_artifact(download_result, ra)
-                    log.info("Stored %s", ra)
+                remote_artifacts = await sync_to_async(lambda: list(ca.remoteartifact_set.all()))()
 
-                await asyncio.gather(*[synchronous_download(ra) for ra in ca.remoteartifact_set.all()])
+                for remote_artifact in remote_artifacts:
+                    async def get_downloader() -> BaseDownloader:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        asyncio.get_running_loop()
+                        remote: Remote = await sync_to_async(lambda: remote_artifact.remote.cast())()
+                        return remote.download_factory.build(remote_artifact.url)
+
+                    downloader = await get_downloader()
+
+                    download_result: DownloadResult = await downloader.run()
+                    log.info("Downloaded %s", remote_artifact)
+                    await sync_to_async(self._save_artifact)(download_result, remote_artifact)
+                    log.info("Stored %s", remote_artifact)
+                    # return ca.remoteartifact_set.all()
+                # await asyncio.gather(*[synchronous_download(ra) for ra in await sync_to_async(get_remote_artifacts)(ca)])
 
             if needs_av_scan:
                 scan_command = shlex.split(security_scan_shell)
@@ -520,10 +536,10 @@ class Handler:
                 if sr:
                     sr.contains_virus = bool(status_code)
                 else:
-                    sr = ScanResult(contains_virus=bool(status_code), content=ca.content, scan_command=security_scan_shell)
-                sr.save()
-
-                log.info("Scanned %s (%s) with %s: contains_virus = %s", ca, ca.content, security_scan_shell, sr.contains_virus)
+                    sr = ScanResult(contains_virus=bool(status_code), content=content, scan_command=security_scan_shell)
+                await sync_to_async(sr.save)()
+                log.info(f"Scanned {ca} {content} with '{security_scan_shell}'"
+                         f"contains_virus = {await sync_to_async(lambda: sr.contains_virus)()}")
 
                 if sr.contains_virus:
                     log.info("Found virus in %s, removing artifact", ca.artifact)
@@ -533,8 +549,8 @@ class Handler:
                     else:
                         artifact = ca.artifact
                         ca.artifact = None
-                        ca.save()
-                        artifact.delete()
+                        await sync_to_async(ca.save)()
+                        await sync_to_async(artifact.delete)()
                     raise VirusFoundError
             else:
                 log.info("Scan not needed for %s due to previous scan result", ca)
@@ -552,8 +568,8 @@ class Handler:
                     # When streamed mode is enabled, remove the artifact part of the content artifact so it will download again with the next request (this is sketchy)
                     artifact = ca.artifact
                     ca.artifact = None
-                    ca.save()
-                    artifact.delete()
+                    await sync_to_async(ca.save)()
+                    await sync_to_async(artifact.delete)()
                     log.info("Artifact is deleted due to streamed policy")
 
         else:
@@ -601,7 +617,7 @@ class Handler:
         await sync_to_async(self._permit)(request, distro)
 
         rel_path = path.lstrip("/")
-        rel_path = rel_path[len(distro.base_path) :]
+        rel_path = rel_path[len(distro.base_path):]
         rel_path = rel_path.lstrip("/")
 
         content_handler_result = await sync_to_async(distro.content_handler)(rel_path)
