@@ -133,22 +133,16 @@ class DeclarativeVersion:
         pipeline = [
             self.first_stage,
             QueryExistingArtifacts(),
-            ArtifactDownloader(),
-            ArtifactSaver(),
-            QueryExistingContents(),
-            ContentSaver(),
-            RemoteArtifactSaver(),
-            ResolveContentFutures(),
         ]
 
         scanner_command = os.environ.get("SECURITY_SCAN_SHELL", "")
         if scanner_command:
-            pipeline.insert(2, ScanResultEjection(scanner_command))  # after QueryExistingArtifacts
-            pipeline.append(ArtifactScanner(scanner_command))
+            pipeline.append(ScanResultEjection(scanner_command))
 
-        ]
+
         if self.acs:
             pipeline.append(ACSArtifactHandler())
+
         pipeline.extend(
             [
                 ArtifactDownloader(),
@@ -159,7 +153,10 @@ class DeclarativeVersion:
                 ResolveContentFutures(),
             ]
         )
+        if scanner_command:
+            pipeline.append(ArtifactScanner(scanner_command))
         return pipeline
+
 
     def create(self):
         """
